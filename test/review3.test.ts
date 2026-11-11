@@ -105,9 +105,9 @@ test('R3 remount while a Personal write is still in flight', async (t) => {
 
 
 
-test('seeded panel/page interleavings with a slow writer preserve the latest click and gate every poll', async (t) => {
+test('seeded panel/page interleavings with clock jumps keep Personal unconditional and gate every poll', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
-  let now = 1000; t.mock.method(Date, 'now', () => ++now);
+  let now = 1_800_000_000_000; t.mock.method(Date, 'now', () => ++now);
   let seed = 0xb407;
   const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 2 ** 32; };
   for (let run = 0; run < 20; run++) {
@@ -122,14 +122,13 @@ test('seeded panel/page interleavings with a slow writer preserve the latest cli
     });
     const doms = [setup(), setup()];
     const boards = doms.map((dom, i) => mountKanbanBoard(windows[i]!.host, dom.element)); await settle();
-    let latest: 'personal' | 'work' = 'work'; let latestAt = 0;
+    let latest: 'personal' | 'work' = 'work';
     const choose = async (index: number, value: 'work' | 'personal') => {
-      const tag = tagSel(doms[index]!.root); tag.value = value; const clickedAt = now + 1;
-      tag.dispatchEvent(new Event('change')); await settle(); return clickedAt;
+      const tag = tagSel(doms[index]!.root); tag.value = value;
+      tag.dispatchEvent(new Event('change')); await settle();
     };
     const verify = async (step: number) => {
       assert.equal((await loadProjectTags(fake.host)).p, latest, `seed run ${run}, step ${step}`);
-      if (latestAt) assert.deepEqual(fake.stored.get('tag:p'), { value: latest, at: latestAt });
       const before = polls.n;
       t.mock.timers.tick(60_000); doms.forEach(dom => dom.win.dispatchEvent(new Event('pageshow'))); await settle();
       if (latest === 'personal') assert.equal(polls.n, before, `no polls: run ${run}, step ${step}`);
@@ -137,19 +136,22 @@ test('seeded panel/page interleavings with a slow writer preserve the latest cli
     try {
       for (let step = 0; step < 25; step++) {
         const index = random() < 0.5 ? 0 : 1;
-        if (step % 6 === 0) {
+        if (step === 1 || step === 2) {
+          now += step === 1 ? 3_600_000 : -3_900_000;
+          await choose(index, 'personal'); latest = 'personal'; await verify(step);
+        } else if (step % 6 === 0) {
           // Block the queue before its tag read, across completed writes in the other window.
           const release = windows[index]!.hang();
           try {
             click(doms[index]!.root, 'Board'); await settle();
-            await choose(index, random() < 0.5 ? 'personal' : 'work');
+            await choose(index, 'personal');
             for (const value of ['work', random() < 0.8 ? 'personal' : 'work'] as const) {
-              latestAt = await choose(1 - index, value); latest = value;
+              await choose(1 - index, value); latest = value;
               await verify(step);
             }
           } finally { release(); }
-          await settle(); await settle(); await verify(step);
-          assert.equal(tagSel(doms[index]!.root).value, latest, 'slow writer adopts the winner');
+          await settle(); await settle(); latest = 'personal'; await verify(step);
+          assert.equal(tagSel(doms[index]!.root).value, 'personal', 'queued Personal always wins');
         } else {
           click(doms[index]!.root, 'Board'); await settle(); await verify(step);
         }

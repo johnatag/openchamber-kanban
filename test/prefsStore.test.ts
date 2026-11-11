@@ -1,4 +1,4 @@
-import { loadProjectTags } from '../src/store/prefs.ts';
+import { loadProjectTags, saveProjectTag } from '../src/store/prefs.ts';
 import type { JsonValue } from '@openchamber/sdk';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -97,7 +97,7 @@ test('legacy tags migrate once, existing per-project values win, and prefs never
   assert.equal(parsePrefs(data.get('prefs')).query, 'updated');
 });
 
-test('tag click ordering rejects stale Personal, favours Personal on ties, and treats old records as time zero', async (t) => {
+test('Personal is unconditional, advances stored time, and Work must be newer', async (t) => {
   const f = fixture(); f.loading.resolve();
   let now = 20; t.mock.method(Date, 'now', () => now);
   let conflicts = 0;
@@ -106,18 +106,53 @@ test('tag click ordering rejects stale Personal, favours Personal on ties, and t
   const stale = store.patch({ projectTags: { p: 'personal' } });
   assert.equal(store.view().projectTags.p, 'personal', 'Personal is immediate');
   await f.flush(); await stale;
-  assert.equal(store.view().projectTags.p, 'work', 'adopts only the newer stored Work'); assert.equal(conflicts, 1);
-  assert.deepEqual(f.stored.get('tag:p'), { value: 'work', at: 21 });
+  assert.equal(store.view().projectTags.p, 'personal'); assert.equal(conflicts, 0);
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'personal', at: 22 });
   now = 21;
   const tiePersonal = store.patch({ projectTags: { p: 'personal' } }); await f.flush(); await tiePersonal;
-  assert.deepEqual(f.stored.get('tag:p'), { value: 'personal', at: 21 });
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'personal', at: 23 });
   const tieWork = store.patch({ projectTags: { p: 'work' } }); await f.flush(); await tieWork;
-  assert.equal(store.view().projectTags.p, 'personal'); assert.equal(conflicts, 2);
-  now = 22;
+  assert.equal(store.view().projectTags.p, 'personal'); assert.equal(conflicts, 1);
+  now = 24;
   const newerWork = store.patch({ projectTags: { p: 'work' } }); await f.flush(); await newerWork;
-  assert.deepEqual(f.stored.get('tag:p'), { value: 'work', at: 22 });
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'work', at: 24 });
   f.stored.set('tag:p', { value: 'personal' });
   now = 1;
   const legacy = store.patch({ projectTags: { p: 'work' } }); await f.flush(); await legacy;
   assert.deepEqual(f.stored.get('tag:p'), { value: 'work', at: 1 });
+  assert.equal(store.view().projectTags.p, 'personal');
+});
+
+
+test('Work sanitizes timestamps at the safe-integer and five-minute boundaries', async (t) => {
+  const f = fixture(); f.loading.resolve(); const now = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  for (const [at, conflict] of [[now + 300_000, true], [now + 300_001, false], [now + 0.5, false], [Number.MAX_SAFE_INTEGER + 1, false], [-1, false]] as const) {
+    f.stored.set('tag:p', { value: 'personal', at });
+    const writing = saveProjectTag(f.host, 'p', 'work', now); await f.flush();
+    const result = await writing;
+    assert.equal(result.conflict, conflict, String(at));
+    assert.equal((await loadProjectTags(f.host)).p, conflict ? 'personal' : 'work');
+  }
+});
+
+test('refresh, unrelated writes, and Work conflicts cannot adopt Work older than a local Personal click', async (t) => {
+  const f = fixture(); f.loading.resolve(); let now = 1000;
+  t.mock.method(Date, 'now', () => now); let conflicts = 0;
+  const store = createPrefsStore(f.host, () => {}, () => { conflicts++; }); await store.load();
+  const personal = store.patch({ projectTags: { p: 'personal' } }); await f.flush(); await personal;
+  for (const at of [999, 1000, Number.MAX_VALUE, now + 300_001]) {
+    f.stored.set('tag:p', { value: 'work', at });
+    await store.reload(); assert.equal(store.view().projectTags.p, 'personal');
+    const query = store.patch({ query: 'keep Personal' }); await f.flush(); await query;
+    assert.equal(store.view().projectTags.p, 'personal');
+  }
+  f.stored.set('tag:p', { value: 'work', at: 1000 }); now = 999;
+  const staleWork = store.patch({ projectTags: { p: 'work' } }); await f.flush(); await staleWork;
+  assert.equal(store.view().projectTags.p, 'personal'); assert.equal(conflicts, 1);
+  f.stored.set('tag:p', { value: 'personal', at: 1001 });
+  const rejectedWork = store.patch({ projectTags: { p: 'work' } }); await f.flush(); await rejectedWork;
+  assert.equal(store.view().projectTags.p, 'personal'); assert.equal(conflicts, 2);
+  now = 1002; f.stored.set('tag:p', { value: 'work', at: 1002 });
+  await store.reload(); assert.equal(store.view().projectTags.p, 'work', 'a newer stored Work may be adopted');
 });

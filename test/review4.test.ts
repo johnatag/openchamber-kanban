@@ -111,3 +111,29 @@ test('R4 A queues Work behind a hung write; B persists Personal after; A drains'
   pa.dispose(); pb.dispose();
 });
 
+
+const tryPersonal = async (stored: unknown, label: string, t: any, nowShift = 0) => {
+  const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] }); const polls = { n: 0 };
+  fake.stored.set('prefs', { projectId: 'p', cockpitEmail: 'me@example.com' }); fake.stored.set('tagMigration', true); fake.stored.set('tag:p', stored);
+  fake.host.serviceRequest = ok(polls) as any;
+  const realNow = Date.now; if (nowShift) Date.now = () => realNow() + nowShift;
+  try {
+    const a = setup(); const board = mountKanbanBoard(fake.host, a.element); await settle();
+    t.after(() => board.dispose());
+    const tag = tagSel(a.root); const before = polls.n;
+    tag.value = 'personal'; tag.dispatchEvent(new Event('change')); await settle(); await settle();
+    t.mock.timers.tick(60000); await settle(); await settle();
+    assert.equal((fake.stored.get('tag:p') as any).value, 'personal', label);
+    assert.equal(tag.value, 'personal', label); assert.equal(polls.n, before, label);
+    // second attempt
+    tag.value = 'personal'; tag.dispatchEvent(new Event('change')); await settle(); await settle(); t.mock.timers.tick(60000); await settle();
+    assert.equal((fake.stored.get('tag:p') as any).value, 'personal', label);
+    assert.equal(tag.value, 'personal', label); assert.equal(polls.n, before, label);
+    board.dispose();
+  } finally { Date.now = realNow; t.mock.timers.reset(); }
+};
+test('R5 future Work locks Personal out?', async (t) => { await tryPersonal({ value: 'work', at: Date.now() + 3600_000 }, 'future+1h', t); });
+test('R5 huge at', async (t) => { await tryPersonal({ value: 'work', at: Number.MAX_VALUE }, 'MAX_VALUE', t); });
+test('R5 clock moved back 5 min after a Work click', async (t) => { await tryPersonal({ value: 'work', at: Date.now() }, 'clock-5min', t, -300_000); });
+test('R5 equal at', async (t) => { const now = Date.now(); const realNow = Date.now; Date.now = () => now; try { await tryPersonal({ value: 'work', at: now }, 'equal', t); } finally { Date.now = realNow; } });
+test('R5 malformed at', async (t) => { await tryPersonal({ value: 'work', at: 'soon' }, 'string-at', t); await tryPersonal({ value: 'work', at: -5 }, 'neg-at', t); await tryPersonal({ value: 'work', at: Infinity }, 'inf-at(JSON null)', t); await tryPersonal({ value: 'work' }, 'no-at', t); await tryPersonal('work', 'legacy-string', t); });

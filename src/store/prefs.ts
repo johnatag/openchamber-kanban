@@ -48,22 +48,25 @@ const parseTagRecord = (raw: unknown): TagRecord => {
   const record = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : { value: raw };
   return {
     value: record.value === 'work' || record.value === 'personal' ? record.value : undefined,
-    at: typeof record.at === 'number' && Number.isFinite(record.at) && record.at >= 0 ? record.at : 0,
+    at: typeof record.at === 'number' && Number.isSafeInteger(record.at) && record.at >= 0 && record.at <= Date.now() + 300_000 ? record.at : 0,
   };
 };
 
-/** Compare the user's click time with storage, including when a queue was blocked. */
+export const loadProjectTag = async (host: Storage, id: string) => parseTagRecord(await host.storage.get(tagKey(id)));
+
+/** Personal always writes; Work and cleanup compare click times after queue delays. */
 export const saveProjectTag = async (host: Storage, id: string, tag: ProjectTag | null, at: number) => {
-  const stored = parseTagRecord(await host.storage.get(tagKey(id)));
-  if (stored.at > at || (stored.at === at && tag !== 'personal')) return { tag: stored.value, conflict: true };
+  const stored = await loadProjectTag(host, id);
+  if (tag !== 'personal' && stored.at >= at) return { tag: stored.value, at: stored.at, conflict: true };
+  if (tag === 'personal') at = Math.max(Date.now(), stored.at + 1);
   if (tag === null) await host.storage.delete(tagKey(id));
   else await host.storage.set(tagKey(id), { value: tag, at });
-  return { tag: tag ?? undefined, conflict: false };
+  return { tag: tag ?? undefined, at, conflict: false };
 };
 
 export const loadProjectTags = async (host: Storage, ids?: readonly string[]): Promise<Record<string, ProjectTag>> => {
   const projectIds = ids ?? (await host.storage.keys()).filter(key => key.startsWith('tag:')).map(key => key.slice(4));
-  const entries = await Promise.all(projectIds.map(async id => [id, parseTagRecord(await host.storage.get(tagKey(id))).value] as const));
+  const entries = await Promise.all(projectIds.map(async id => [id, (await loadProjectTag(host, id)).value] as const));
   return Object.fromEntries(entries.filter((entry): entry is readonly [string, ProjectTag] => entry[1] !== undefined));
 };
 
