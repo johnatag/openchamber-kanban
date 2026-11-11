@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import http from 'node:http';
 import path from 'node:path';
+import { filterCockpitTasks } from '../domain/cockpit.ts';
 import { createCockpitReader } from './cockpit.ts';
 import { readHarnessFeed } from './harness.ts';
 import { parseGitRefOutput } from '../domain/worktree.ts';
@@ -32,10 +33,15 @@ export const createServiceServer = (token: string, lanesFile: string, cockpit = 
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
     if (url.pathname === '/health') { json(res, 200, { ok: true }); return; }
     if (url.pathname === '/cockpit-tasks') {
-      if (req.method !== 'GET' || url.search || req.headers['transfer-encoding'] || Number(req.headers['content-length'] ?? 0) !== 0) {
-        json(res, 400, { error: 'cockpit-tasks accepts GET without parameters or body' }); return;
+      if (req.method !== 'GET' || [...url.searchParams.keys()].some(key => !['email', 'mode', 'subtasks'].includes(key)) || req.headers['transfer-encoding'] || Number(req.headers['content-length'] ?? 0) !== 0) {
+        json(res, 400, { error: 'cockpit-tasks accepts GET with filter parameters and no body' }); return;
       }
-      void cockpit().then((body) => json(res, 200, body));
+      void cockpit().then(body => {
+        if (body.status !== 'ok') { json(res, 200, body); return; }
+        const cancelledHidden = filterCockpitTasks(body.cancelledTasks ?? [], url.searchParams.get('email') ?? '',
+          url.searchParams.get('mode') === 'all_in_progress' ? 'all_in_progress' : 'mine', url.searchParams.get('subtasks') === 'true').length;
+        json(res, 200, { status: 'ok', tasks: body.tasks, cancelledHidden });
+      });
       return;
     }
     if (url.pathname === '/harness-lanes') {

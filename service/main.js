@@ -7,12 +7,6 @@ import { execFile } from "node:child_process";
 import http from "node:http";
 import path2 from "node:path";
 
-// src/service/cockpit.ts
-import { open } from "node:fs/promises";
-import { constants } from "node:fs";
-import { homedir } from "node:os";
-import path from "node:path";
-
 // src/domain/cockpit.ts
 var COCKPIT_STATUSES = ["todo", "in_progress", "in_review", "qa", "done"];
 var keyPattern = /^[A-Z]{2,6}-\d+(\.\d+)*$/;
@@ -26,9 +20,9 @@ var slimCockpitTasks = (input) => {
   for (const value of input) {
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid Cockpit task");
     const r = value;
+    if (r.cancelledAt != null) continue;
     if (!text(r.key, 128) || !keyPattern.test(r.key) || keys.has(r.key) || !text(r.title) || !COCKPIT_STATUSES.includes(r.status) || !(r.priority == null || text(r.priority, 128) || typeof r.priority === "number" && Number.isFinite(r.priority)) || !Array.isArray(r.assignees) || r.assignees.some((a) => !a || !text(a.email, 320) || !nullableText(a.name)) || !(r.parentTaskKey == null || text(r.parentTaskKey, 128) && keyPattern.test(r.parentTaskKey)) || !nullableText(r.prUrl) || !text(r.updatedAt, 128) || !Number.isFinite(Date.parse(r.updatedAt)) || !hours(r.estimateHours) || !hours(r.spentHours)) throw new Error("Invalid Cockpit task");
     keys.add(r.key);
-    if (r.cancelledAt != null) continue;
     result.push({
       key: r.key,
       title: r.title,
@@ -46,13 +40,21 @@ var slimCockpitTasks = (input) => {
 };
 var slimCancelledTasks = (input) => {
   if (!Array.isArray(input)) throw new Error("Invalid cancelled tasks");
-  return input.map((task) => {
-    if (!task || !COCKPIT_STATUSES.includes(task.status) || !Array.isArray(task.assignees) || task.assignees.some((a) => !a || !text(a.email, 320)) || !(task.parentTaskKey == null || text(task.parentTaskKey, 128) && keyPattern.test(task.parentTaskKey))) throw new Error("Invalid cancelled task");
-    return { status: task.status, assignees: task.assignees.map((a) => ({ email: a.email })), parentTaskKey: task.parentTaskKey ?? null };
+  return input.flatMap((task) => {
+    if (!task || typeof task !== "object" || Array.isArray(task) || !COCKPIT_STATUSES.includes(task.status) || !Array.isArray(task.assignees) || task.assignees.some((a) => !a || !text(a.email, 320)) || !(task.parentTaskKey == null || text(task.parentTaskKey, 128) && keyPattern.test(task.parentTaskKey))) return [];
+    return [{ status: task.status, assignees: task.assignees.map((a) => ({ email: a.email })), parentTaskKey: task.parentTaskKey ?? null }];
   });
+};
+var filterCockpitTasks = (tasks, email, mode, includeSubtasks) => {
+  const normalized = email.trim().toLowerCase();
+  return tasks.filter((t) => t.status !== "done" && (includeSubtasks || !t.parentTaskKey) && (mode === "all_in_progress" ? t.status === "in_progress" : normalized !== "" && t.assignees.some((a) => a.email.trim().toLowerCase() === normalized)));
 };
 
 // src/service/cockpit.ts
+import { open } from "node:fs/promises";
+import { constants } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
 var ENDPOINT = "https://cockpit.internal.angelsoftwares.ca/api/mcp/server";
 var VERSION = "2025-03-26";
 var ALLOWED_TOOLS = /* @__PURE__ */ new Set(["list_tasks", "get_task"]);
@@ -417,11 +419,23 @@ var createServiceServer = (token2, lanesFile2, cockpit = createCockpitReader()) 
       return;
     }
     if (url.pathname === "/cockpit-tasks") {
-      if (req.method !== "GET" || url.search || req.headers["transfer-encoding"] || Number(req.headers["content-length"] ?? 0) !== 0) {
-        json(res, 400, { error: "cockpit-tasks accepts GET without parameters or body" });
+      if (req.method !== "GET" || [...url.searchParams.keys()].some((key) => !["email", "mode", "subtasks"].includes(key)) || req.headers["transfer-encoding"] || Number(req.headers["content-length"] ?? 0) !== 0) {
+        json(res, 400, { error: "cockpit-tasks accepts GET with filter parameters and no body" });
         return;
       }
-      void cockpit().then((body) => json(res, 200, body));
+      void cockpit().then((body) => {
+        if (body.status !== "ok") {
+          json(res, 200, body);
+          return;
+        }
+        const cancelledHidden = filterCockpitTasks(
+          body.cancelledTasks ?? [],
+          url.searchParams.get("email") ?? "",
+          url.searchParams.get("mode") === "all_in_progress" ? "all_in_progress" : "mine",
+          url.searchParams.get("subtasks") === "true"
+        ).length;
+        json(res, 200, { status: "ok", tasks: body.tasks, cancelledHidden });
+      });
       return;
     }
     if (url.pathname === "/harness-lanes") {

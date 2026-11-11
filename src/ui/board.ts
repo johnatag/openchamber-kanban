@@ -3,7 +3,8 @@ import { mountBanner, mountButton, mountSearchField, mountSelect, mountSpinner }
 import { applyPatch, createTask, DEFAULT_TASK_TITLE, STATUSES, STATUS_LABELS, type Task, type TaskPatch, type TaskStatus } from '../domain/task.ts';
 import { ALL_PROJECTS, NO_PROJECT, groupColumns, planDrop, rankAtEnd, type BoardFilter } from '../domain/board.ts';
 import { deleteTask, loadTasks, saveTask } from '../store/taskStore.ts';
-import { DEFAULT_PREFS, loadPrefs, savePrefs, type Prefs } from '../store/prefs.ts';
+import { DEFAULT_PREFS, type Prefs } from '../store/prefs.ts';
+import { createPrefsStore } from '../store/prefsStore.ts';
 import { loadOrphanWatermark, saveOrphanWatermark } from '../store/orphanWatermark.ts';
 import { loadDismissedSessions, saveDismissedSessions } from '../store/dismissedSessions.ts';
 import { describeHostError, describeStartSessionDelivery, fetchSessions, fetchWorktrees, watchProjects } from '../host/workspace.ts';
@@ -148,36 +149,24 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
   let tasks: Task[] = [];
   let projects: GuestProject[] = [];
   let prefs: Prefs = { ...DEFAULT_PREFS };
-  // Every writer merges only its own fields. Serialize storage and read the latest
-  // state when a write starts so an older snapshot cannot resurrect a Work tag.
-  let prefsQueue: Promise<void> = Promise.resolve();
-  let prefsRevision = 0;
-  const fieldVersions = new Map<keyof Prefs, number>();
-  const patchPrefs = (patch: Partial<Prefs>): Promise<void> => {
-    const previous = prefs;
-    const revision = ++prefsRevision;
-    const keys = Object.keys(patch) as (keyof Prefs)[];
-    for (const key of keys) fieldVersions.set(key, revision);
-    prefs = { ...prefs, ...patch };
-    const saved = prefsQueue.then(() => savePrefs(host, prefs)).catch(error => {
-      const rollback = Object.fromEntries(keys.filter(key => fieldVersions.get(key) === revision).map(key => [key, previous[key]]));
-      prefs = { ...prefs, ...rollback };
-      if (!disposed) {
-        filter = { projectId: prefs.projectId, query: prefs.query };
-        projectSelect.update({ value: filter.projectId });
-        searchField.update({ value: filter.query });
-        cockpit.setPrefs(prefs, hasCockpitScope({ projects, projectId: filter.projectId, projectTags: prefs.projectTags }));
-        render();
-      }
-      throw error;
-    });
-    prefsQueue = saved.catch(() => undefined);
-    return saved;
-  };
+  const prefsStore = createPrefsStore(host, value => {
+    prefs = value;
+    if (!disposed) {
+      filter = { projectId: prefs.projectId, query: prefs.query };
+      projectSelect.update({ value: filter.projectId });
+      searchField.update({ value: filter.query });
+      cockpit.setPrefs(prefs, projectsReady && hasCockpitScope({ projects, projectId: filter.projectId, projectTags: prefs.projectTags }));
+      render();
+    }
+  });
+  const patchPrefs = prefsStore.patch;
+  let missingTags = new Set<string>();
   const pruneProjectTags = () => {
-    if (!projectsReady) return;
-    const tags = Object.fromEntries(Object.entries(prefs.projectTags).filter(([id]) => projects.some(project => project.id === id)));
-    if (Object.keys(tags).length !== Object.keys(prefs.projectTags).length) void patchPrefs({ projectTags: tags }).catch(notify);
+    if (!projectsReady || !projects.length) { missingTags.clear(); return; }
+    const missing = new Set(Object.keys(prefs.projectTags).filter(id => !projects.some(project => project.id === id)));
+    const deletions = Object.fromEntries([...missing].filter(id => missingTags.has(id)).map(id => [id, null]));
+    missingTags = missing;
+    if (Object.keys(deletions).length) void patchPrefs({ projectTags: deletions }).catch(notify);
   };
   let cockpitTasks: CockpitTask[] = [];
   let cockpitHasContent = true;
@@ -381,7 +370,7 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     const project = projects.find(project => project.id === filter.projectId);
     if (!project) return;
     const personal = projectTag.value !== 'work';
-    const saving = patchPrefs({ projectTags: { ...prefs.projectTags, [project.id]: personal ? 'personal' : 'work' } });
+    const saving = patchPrefs({ projectTags: { [project.id]: personal ? 'personal' : 'work' } });
     if (personal) render(); // Fail safe immediately, including any in-flight poll.
     void saving.then(() => { if (!disposed) render(); }, notify);
   });
@@ -813,10 +802,9 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     importSessions.update({ disabled: true });
     try {
       await Promise.all(pendingAdoptions);
-      await prefsQueue;
-      const revision = prefsRevision;
-      const [{ tasks: loaded, failedKeys }, loadedPrefs, watermark, dismissed] = await Promise.all([
-        loadTasks(host), loadPrefs(host), loadOrphanWatermark(host), loadDismissedSessions(host),
+      await prefsStore.idle();
+      const [{ tasks: loaded, failedKeys }, , watermark, dismissed] = await Promise.all([
+        loadTasks(host), prefsStore.reload(), loadOrphanWatermark(host), loadDismissedSessions(host),
       ]);
       // A manual/initial reload is a clean slate for the retry guards above.
       attemptedSessions = new Set();
@@ -830,8 +818,6 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
         orphanWatermark = watermark;
       }
       setTasks(loaded);
-      if (revision === prefsRevision) prefs = loadedPrefs;
-      pruneProjectTags();
       filter = { projectId: prefs.projectId, query: prefs.query };
       projectSelect.update({ value: filter.projectId, options: projectOptions() });
       searchField.update({ value: filter.query });
@@ -856,7 +842,7 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
   };
 
   const cockpit = mountCockpitFeed(host, tabs.panels.cockpit, async (patch) => {
-    await patchPrefs(patch);
+    try { await patchPrefs(patch); } catch (error) { notify(error); throw error; }
     if (!disposed) cockpit.setPrefs(prefs, hasCockpitScope({ projects, projectId: filter.projectId, projectTags: prefs.projectTags }));
   }, (next) => { cockpitTasks = next; harness.setCockpitTasks(next); render(); }, available => {
     cockpitHasContent = available;
@@ -868,6 +854,7 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
   void watchProjects(host, (state) => {
     if (disposed) return;
     projectsReady = state.state === 'ready';
+    if (!projectsReady) missingTags.clear();
     updateImportAvailability();
     if (state.state === 'error') { showBanner('Projects unavailable', 'Showing tasks without live project data.', 'warning'); return; }
     projects = state.projects;

@@ -54,7 +54,7 @@ const fixture = async () => {
     if (body.method === 'notifications/initialized') { res.writeHead(202); res.end(); return; }
     let result: unknown;
     if (body.method === 'initialize') { if (mode !== 'stateless') res.setHeader('Mcp-Session-Id', 'test-session'); result = { protocolVersion: mode === 'bad-version' ? 'invalid' : '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'fake', version: '1' } }; }
-    else { lists++; result = mode === 'tool-error' ? { isError: true, content: [{ type: 'text', text: secret }] } : { content: [{ type: 'text', text: JSON.stringify({ tasks: mode === 'bad-task' ? [task({ status: 'garbage' })] : [task(mode === 'reflected-key' ? { title: secret } : {}), task({ key: 'COC-99', cancelledAt: '2026-11-11' })] }) }] }; }
+    else { lists++; result = mode === 'tool-error' ? { isError: true, content: [{ type: 'text', text: secret }] } : { content: [{ type: 'text', text: JSON.stringify({ tasks: mode === 'bad-task' ? [task({ status: 'garbage' })] : [task(mode === 'reflected-key' ? { title: secret } : {}), task({ key: 'COC-99', cancelledAt: '2026-11-11' }), { cancelledAt: 'yesterday', assignees: null }] }) }] }; }
     if (mode === 'structured' && body.method === 'tools/call') result = { structuredContent: { tasks: [task()] } };
     const response = JSON.stringify({ jsonrpc: '2.0', id: mode === 'bad-id' ? 999 : body.id, result });
     if (mode === 'sse') { res.write(': heartbeat\r\n\r\nevent: message\r\ndata: ' + response + '\r\n\r\n'); /* Deliberately keep stream open. */ }
@@ -112,6 +112,11 @@ test('HTTP API cannot select tools, origin, credential path or send writes', asy
     assert.equal((await localFetch(origin + '/cockpit-tasks', { method: 'POST', body: '{}', headers: { authorization: 'Bearer local-token' } })).status, 400);
     assert.equal(f.calls.length, 0);
     const result = await (await localFetch(origin + '/cockpit-tasks', { headers: { authorization: 'Bearer local-token' } })).json(); assert.equal(result.status, 'ok');
+    assert.equal('cancelledTasks' in result, false);
+    assert.equal(result.cancelledHidden, 0);
+    const mine = await (await localFetch(origin + '/cockpit-tasks?email=me%40example.com&mode=mine&subtasks=false', { headers: { authorization: 'Bearer local-token' } })).json();
+    assert.equal(mine.cancelledHidden, 1);
+    assert.deepEqual(Object.keys(mine).sort(), ['cancelledHidden', 'status', 'tasks']);
     assert.deepEqual(f.calls.filter(c => c.method === 'tools/call').map(c => c.params.name), ['list_tasks']);
   } finally { await close(server); await f.cleanup(); }
 });

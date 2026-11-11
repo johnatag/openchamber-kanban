@@ -7,7 +7,7 @@ export type CockpitTask = {
   estimateHours: number | null; spentHours: number | null;
 };
 export type CockpitFilterTask = Pick<CockpitTask, 'status' | 'parentTaskKey'> & { assignees: { email: string }[] };
-export type CockpitResponse = { status: 'ok'; tasks: CockpitTask[]; cancelledTasks?: CockpitFilterTask[] } | { status: 'unavailable'; reason: string };
+export type CockpitResponse = { status: 'ok'; tasks: CockpitTask[]; cancelledHidden?: number } | { status: 'unavailable'; reason: string };
 export type CockpitMode = 'mine' | 'all_in_progress';
 const keyPattern = /^[A-Z]{2,6}-\d+(\.\d+)*$/;
 const text = (v: unknown, max = 4096): v is string => typeof v === 'string' && v.length <= max;
@@ -22,6 +22,7 @@ export const slimCockpitTasks = (input: unknown): CockpitTask[] => {
   for (const value of input) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid Cockpit task');
     const r = value as Record<string, unknown>;
+    if (r.cancelledAt != null) continue;
     if (!text(r.key, 128) || !keyPattern.test(r.key) || keys.has(r.key) || !text(r.title) ||
       !COCKPIT_STATUSES.includes(r.status as CockpitStatus) ||
       !(r.priority == null || text(r.priority, 128) || (typeof r.priority === 'number' && Number.isFinite(r.priority))) ||
@@ -30,7 +31,6 @@ export const slimCockpitTasks = (input: unknown): CockpitTask[] => {
       !nullableText(r.prUrl) || !text(r.updatedAt, 128) || !Number.isFinite(Date.parse(r.updatedAt)) ||
       !hours(r.estimateHours) || !hours(r.spentHours)) throw new Error('Invalid Cockpit task');
     keys.add(r.key);
-    if (r.cancelledAt != null) continue;
     result.push({ key: r.key, title: r.title, status: r.status as CockpitStatus, priority: r.priority as CockpitTask['priority'] ?? null,
       assignees: r.assignees.map(a => ({ email: a.email, name: a.name ?? null })), parentTaskKey: r.parentTaskKey as string ?? null,
       prUrl: r.prUrl as string ?? null, updatedAt: r.updatedAt, estimateHours: r.estimateHours as number ?? null, spentHours: r.spentHours as number ?? null });
@@ -40,11 +40,11 @@ export const slimCockpitTasks = (input: unknown): CockpitTask[] => {
 // Only the fields needed to count cancelled tasks within the active filters.
 export const slimCancelledTasks = (input: unknown): CockpitFilterTask[] => {
   if (!Array.isArray(input)) throw new Error('Invalid cancelled tasks');
-  return input.map(task => {
-    if (!task || !COCKPIT_STATUSES.includes(task.status) || !Array.isArray(task.assignees) ||
+  return input.flatMap(task => {
+    if (!task || typeof task !== 'object' || Array.isArray(task) || !COCKPIT_STATUSES.includes(task.status) || !Array.isArray(task.assignees) ||
       task.assignees.some((a: any) => !a || !text(a.email, 320)) ||
-      !(task.parentTaskKey == null || (text(task.parentTaskKey, 128) && keyPattern.test(task.parentTaskKey)))) throw new Error('Invalid cancelled task');
-    return { status: task.status, assignees: task.assignees.map((a: any) => ({ email: a.email })), parentTaskKey: task.parentTaskKey ?? null };
+      !(task.parentTaskKey == null || (text(task.parentTaskKey, 128) && keyPattern.test(task.parentTaskKey)))) return [];
+    return [{ status: task.status, assignees: task.assignees.map((a: any) => ({ email: a.email })), parentTaskKey: task.parentTaskKey ?? null }];
   });
 };
 export const filterCockpitTasks = <T extends CockpitFilterTask>(tasks: readonly T[], email: string, mode: CockpitMode, includeSubtasks: boolean) => {

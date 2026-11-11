@@ -2,7 +2,9 @@ import { open } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { slimCancelledTasks, slimCockpitTasks, type CockpitResponse } from '../domain/cockpit.ts';
+import { slimCancelledTasks, slimCockpitTasks, type CockpitResponse, type CockpitFilterTask } from '../domain/cockpit.ts';
+
+export type CockpitSnapshot = CockpitResponse & { cancelledTasks?: CockpitFilterTask[] };
 
 const ENDPOINT = 'https://cockpit.internal.angelsoftwares.ca/api/mcp/server';
 const VERSION = '2025-03-26';
@@ -35,11 +37,11 @@ export const createCockpitReader = (options: { fetch?: typeof fetch; now?: () =>
   const request = options.fetch ?? fetch;
   const now = options.now ?? Date.now;
   const maxBytes = options.maxBytes ?? 12 * 1024 * 1024;
-  let cached: Extract<CockpitResponse, { status: 'ok' }> | null = null;
+  let cached: Extract<CockpitSnapshot, { status: 'ok' }> | null = null;
   let expires = 0;
-  let flight: Promise<CockpitResponse> | null = null;
+  let flight: Promise<CockpitSnapshot> | null = null;
 
-  const refresh = async (): Promise<CockpitResponse> => {
+  const refresh = async (): Promise<CockpitSnapshot> => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 15_000);
     let key: string | null = null;
@@ -127,7 +129,7 @@ export const createCockpitReader = (options: { fetch?: typeof fetch; now?: () =>
       }
     }
   };
-  return (): Promise<CockpitResponse> => {
+  return (): Promise<CockpitSnapshot> => {
     if (flight) return flight;
     if (cached && now() < expires) return Promise.resolve(cached);
     flight = refresh().finally(() => { flight = null; });

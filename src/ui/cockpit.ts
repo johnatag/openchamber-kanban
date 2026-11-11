@@ -31,7 +31,7 @@ export const mountCockpitFeed = (host: Pick<HostClient, 'serviceRequest' | 'toas
     if (!result) { message.textContent = 'Loading Cockpit tasks…'; return; }
     if (result.status === 'unavailable') { message.textContent = 'Cockpit unavailable: ' + result.reason; return; }
     const visible = filterCockpitTasks(result.tasks, prefs.cockpitEmail, prefs.cockpitMode, prefs.cockpitSubtasks);
-    const cancelledHidden = filterCockpitTasks(result.cancelledTasks ?? [], prefs.cockpitEmail, prefs.cockpitMode, prefs.cockpitSubtasks).length;
+    const cancelledHidden = result.cancelledHidden ?? 0;
     message.textContent = (visible.length ? 'Read-only · updated every 60 seconds' : 'No matching open Cockpit tasks') + (cancelledHidden ? ' · ' + cancelledHidden + ' cancelled hidden' : '');
     for (const status of COCKPIT_STATUSES) {
       const tasks = visible.filter(t => t.status === status); if (!tasks.length) continue;
@@ -65,7 +65,7 @@ export const mountCockpitFeed = (host: Pick<HostClient, 'serviceRequest' | 'toas
     if (!ready || !enabled || !prefs.cockpitEmail || disposed || busy || !frameVisible || document.hidden) return;
     busy = true; const started = generation;
     try {
-      const next = await fetchCockpitTasks(host);
+      const next = await fetchCockpitTasks(host, prefs);
       if (disposed || started !== generation || !enabled || !prefs.cockpitEmail) return;
       result = next;
       onTasks(result.status === 'ok' ? result.tasks : []); render();
@@ -75,7 +75,7 @@ export const mountCockpitFeed = (host: Pick<HostClient, 'serviceRequest' | 'toas
   const hide = () => { frameVisible = false; visibility(); }; const show = () => { frameVisible = true; visibility(); };
   window.addEventListener('pagehide', hide); window.addEventListener('pageshow', show); document.addEventListener('visibilitychange', visibility);
   const setPrefs = (value: CockpitPrefs, allowed = enabled) => {
-    const changed = !ready || prefs.cockpitEmail !== value.cockpitEmail || allowed !== enabled;
+    const changed = !ready || prefs.cockpitEmail !== value.cockpitEmail || prefs.cockpitMode !== value.cockpitMode || prefs.cockpitSubtasks !== value.cockpitSubtasks || allowed !== enabled;
     prefs = value; enabled = allowed; ready = true;
     if (changed) { generation++; result = null; if (timer) clearTimeout(timer); timer = null; onTasks([]); }
     updateControls(); if (changed) void poll();
