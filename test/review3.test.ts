@@ -105,9 +105,8 @@ test('R3 remount while a Personal write is still in flight', async (t) => {
 
 
 
-test('seeded panel/page interleavings with clock jumps keep Personal unconditional and gate every poll', async (t) => {
+test('seeded panel/page interleavings with arbitrary delays and stuck queues keep Personal unconditional and gate every poll', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
-  let now = 1_800_000_000_000; t.mock.method(Date, 'now', () => ++now);
   let seed = 0xb407;
   const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 2 ** 32; };
   for (let run = 0; run < 20; run++) {
@@ -137,7 +136,7 @@ test('seeded panel/page interleavings with clock jumps keep Personal uncondition
       for (let step = 0; step < 25; step++) {
         const index = random() < 0.5 ? 0 : 1;
         if (step === 1 || step === 2) {
-          now += step === 1 ? 3_600_000 : -3_900_000;
+          t.mock.timers.tick(Math.floor(random() * 3_600_000)); await settle();
           await choose(index, 'personal'); latest = 'personal'; await verify(step);
         } else if (step % 6 === 0) {
           // Block the queue before its tag read, across completed writes in the other window.
@@ -152,6 +151,16 @@ test('seeded panel/page interleavings with clock jumps keep Personal uncondition
           } finally { release(); }
           await settle(); await settle(); latest = 'personal'; await verify(step);
           assert.equal(tagSel(doms[index]!.root).value, 'personal', 'queued Personal always wins');
+        } else if (step % 6 === 3) {
+          const release = windows[index]!.hang();
+          try {
+            click(doms[index]!.root, 'Board'); await settle();
+            await choose(index, 'work');
+            t.mock.timers.tick(Math.floor(random() * 3_600_000)); await settle();
+            await choose(1 - index, 'personal'); latest = 'personal'; await verify(step);
+          } finally { release(); }
+          await settle(); await settle(); await verify(step);
+          assert.ok(fake.toasts.includes('Changed elsewhere, choose again'));
         } else {
           click(doms[index]!.root, 'Board'); await settle(); await verify(step);
         }
@@ -191,10 +200,10 @@ test('failed and refused storage checks retry after 60 seconds and remain gated'
     fake.host.storage.get = get;
     t.mock.timers.tick(59_999); await settle(); assert.equal(polls.n, before);
     t.mock.timers.tick(1); await settle(); assert.equal(polls.n, before + 1, 'transient error recovers on timer');
-    fake.stored.set('tag:p', { value: 'personal', at: 100 });
+    fake.stored.set('tag:p', { value: 'personal', rev: 100 });
     t.mock.timers.tick(60_000); await settle(); assert.equal(polls.n, before + 1);
     t.mock.timers.tick(60_000); await settle(); assert.equal(polls.n, before + 1, 'denied checks never poll');
-    fake.stored.set('tag:p', { value: 'work', at: 101 });
+    fake.stored.set('tag:p', { value: 'work', rev: 101 });
     t.mock.timers.tick(60_000); await settle(); assert.equal(polls.n, before + 2, 'refused check recovers on timer');
   } finally { board.dispose(); }
 });

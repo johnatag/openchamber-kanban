@@ -1,4 +1,5 @@
-import { loadProjectTags, saveProjectTag } from '../src/store/prefs.ts';
+import { readFileSync } from 'node:fs';
+import { loadProjectTag, loadProjectTags, saveProjectTag } from '../src/store/prefs.ts';
 import type { JsonValue } from '@openchamber/sdk';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -45,8 +46,7 @@ test('two stores re-read confirmed fields and only write their own patches', asy
   assert.equal(prefs.cockpitEmail, 'new@example.com'); assert.equal(prefs.query, 'other surface'); assert.equal(prefs.projectTags.p, 'personal');
 });
 
-test('seeded interleavings across two stores never replay stale Work tags or unrelated fields', async (t) => {
-  let now = 1000; t.mock.method(Date, 'now', () => ++now);
+test('seeded interleavings across two stores never replay stale Work tags or unrelated fields', async () => {
   let seed = 0x61b3;
   const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 2 ** 32; };
   for (let run = 0; run < 40; run++) {
@@ -97,62 +97,92 @@ test('legacy tags migrate once, existing per-project values win, and prefs never
   assert.equal(parsePrefs(data.get('prefs')).query, 'updated');
 });
 
-test('Personal is unconditional, advances stored time, and Work must be newer', async (t) => {
-  const f = fixture(); f.loading.resolve();
-  let now = 20; t.mock.method(Date, 'now', () => now);
-  let conflicts = 0;
+test('Personal advances revisions unconditionally and a fresh Work click succeeds', async () => {
+  const f = fixture(); f.loading.resolve(); let conflicts = 0;
   const store = createPrefsStore(f.host, () => {}, () => { conflicts++; }); await store.load();
-  f.stored.set('tag:p', { value: 'work', at: 21 });
-  const stale = store.patch({ projectTags: { p: 'personal' } });
-  assert.equal(store.view().projectTags.p, 'personal', 'Personal is immediate');
-  await f.flush(); await stale;
-  assert.equal(store.view().projectTags.p, 'personal'); assert.equal(conflicts, 0);
-  assert.deepEqual(f.stored.get('tag:p'), { value: 'personal', at: 22 });
-  now = 21;
-  const tiePersonal = store.patch({ projectTags: { p: 'personal' } }); await f.flush(); await tiePersonal;
-  assert.deepEqual(f.stored.get('tag:p'), { value: 'personal', at: 23 });
-  const tieWork = store.patch({ projectTags: { p: 'work' } }); await f.flush(); await tieWork;
-  assert.equal(store.view().projectTags.p, 'personal'); assert.equal(conflicts, 1);
-  now = 24;
-  const newerWork = store.patch({ projectTags: { p: 'work' } }); await f.flush(); await newerWork;
-  assert.deepEqual(f.stored.get('tag:p'), { value: 'work', at: 24 });
-  f.stored.set('tag:p', { value: 'personal' });
-  now = 1;
-  const legacy = store.patch({ projectTags: { p: 'work' } }); await f.flush(); await legacy;
-  assert.deepEqual(f.stored.get('tag:p'), { value: 'work', at: 1 });
+  f.stored.set('tag:p', { value: 'work', rev: 21 });
+  const personal = store.patch({ projectTags: { p: 'personal' } });
   assert.equal(store.view().projectTags.p, 'personal');
+  await f.flush(); await personal;
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'personal', rev: 22 });
+  const work = store.patch({ projectTags: { p: 'work' } }); await f.flush(); await work;
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'work', rev: 23 });
+  assert.equal(store.view().projectTags.p, 'work'); assert.equal(conflicts, 0);
 });
 
-
-test('Work sanitizes timestamps at the safe-integer and five-minute boundaries', async (t) => {
-  const f = fixture(); f.loading.resolve(); const now = 1_800_000_000_000;
-  t.mock.method(Date, 'now', () => now);
-  for (const [at, conflict] of [[now + 300_000, true], [now + 300_001, false], [now + 0.5, false], [Number.MAX_SAFE_INTEGER + 1, false], [-1, false]] as const) {
-    f.stored.set('tag:p', { value: 'personal', at });
-    const writing = saveProjectTag(f.host, 'p', 'work', now); await f.flush();
-    const result = await writing;
-    assert.equal(result.conflict, conflict, String(at));
-    assert.equal((await loadProjectTags(f.host)).p, conflict ? 'personal' : 'work');
+test('missing and malformed revisions are zero; safe integer boundaries never overflow', async () => {
+  const f = fixture(); f.loading.resolve();
+  for (const rev of [undefined, '1', -1, 0.5, Infinity, Number.MAX_SAFE_INTEGER + 1, 0, 1, Number.MAX_SAFE_INTEGER - 1]) {
+    f.stored.set('tag:p', { value: 'personal', rev } as any);
+    const expected = typeof rev === 'number' && Number.isSafeInteger(rev) && rev >= 0 ? rev : 0;
+    assert.equal((await loadProjectTag(f.host, 'p')).rev, expected);
+    const writing = saveProjectTag(f.host, 'p', 'work', expected); await f.flush();
+    assert.equal((await writing).conflict, false);
+    assert.deepEqual(f.stored.get('tag:p'), { value: 'work', rev: expected + 1 });
   }
+  f.stored.set('tag:p', { value: 'work', rev: Number.MAX_SAFE_INTEGER });
+  await assert.rejects(saveProjectTag(f.host, 'p', 'personal', 0), /revision exhausted/);
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'work', rev: Number.MAX_SAFE_INTEGER });
 });
 
-test('refresh, unrelated writes, and Work conflicts cannot adopt Work older than a local Personal click', async (t) => {
-  const f = fixture(); f.loading.resolve(); let now = 1000;
-  t.mock.method(Date, 'now', () => now); let conflicts = 0;
-  const store = createPrefsStore(f.host, () => {}, () => { conflicts++; }); await store.load();
+test('refresh and unrelated writes adopt Work only above the last local Personal revision', async () => {
+  const f = fixture(); f.loading.resolve(); const store = createPrefsStore(f.host); await store.load();
+  f.stored.set('tag:p', { value: 'work', rev: 10 });
   const personal = store.patch({ projectTags: { p: 'personal' } }); await f.flush(); await personal;
-  for (const at of [999, 1000, Number.MAX_VALUE, now + 300_001]) {
-    f.stored.set('tag:p', { value: 'work', at });
+  for (const rev of [0, 10, 11, Number.MAX_VALUE]) {
+    f.stored.set('tag:p', { value: 'work', rev });
     await store.reload(); assert.equal(store.view().projectTags.p, 'personal');
     const query = store.patch({ query: 'keep Personal' }); await f.flush(); await query;
     assert.equal(store.view().projectTags.p, 'personal');
   }
-  f.stored.set('tag:p', { value: 'work', at: 1000 }); now = 999;
-  const staleWork = store.patch({ projectTags: { p: 'work' } }); await f.flush(); await staleWork;
-  assert.equal(store.view().projectTags.p, 'personal'); assert.equal(conflicts, 1);
-  f.stored.set('tag:p', { value: 'personal', at: 1001 });
-  const rejectedWork = store.patch({ projectTags: { p: 'work' } }); await f.flush(); await rejectedWork;
-  assert.equal(store.view().projectTags.p, 'personal'); assert.equal(conflicts, 2);
-  now = 1002; f.stored.set('tag:p', { value: 'work', at: 1002 });
-  await store.reload(); assert.equal(store.view().projectTags.p, 'work', 'a newer stored Work may be adopted');
+  f.stored.set('tag:p', { value: 'work', rev: 12 });
+  await store.reload(); assert.equal(store.view().projectTags.p, 'work');
+  f.stored.set('tag:p', { value: 'personal', rev: 0 });
+  await store.reload(); assert.equal(store.view().projectTags.p, 'personal', 'Personal always adopts');
+});
+
+test('queued cleanup and Work capture revisions before waiting and visibly refuse conflicts', async () => {
+  for (const tag of [null, 'work'] as const) {
+    const f = fixture(); f.loading.resolve(); let conflicts = 0;
+    const store = createPrefsStore(f.host, () => {}, () => { conflicts++; }); await store.load();
+    const blocked = store.patch({ query: 'block queue' }); await settle();
+    const queued = store.patch({ projectTags: { p: tag } }); await settle();
+    f.stored.set('tag:p', { value: 'personal', rev: 1 });
+    await f.flush(); await Promise.all([blocked, queued]);
+    assert.deepEqual(f.stored.get('tag:p'), { value: 'personal', rev: 1 });
+    assert.equal(store.view().projectTags.p, 'personal'); assert.equal(conflicts, 1);
+    const retry = store.patch({ projectTags: { p: tag } }); await f.flush(); await retry;
+    assert.equal((await loadProjectTags(f.host)).p, tag ?? undefined);
+  }
+});
+
+test('a failed click-time Work read is surfaced after queue delay and requires a fresh click', async () => {
+  const f = fixture(); f.loading.resolve(); f.stored.set('tag:p', { value: 'personal', rev: 1 });
+  const store = createPrefsStore(f.host); await store.load();
+  const blocked = store.patch({ query: 'block queue' }); await settle();
+  const get = f.host.storage.get;
+  f.host.storage.get = async key => { if (key === 'tag:p') throw new Error('click read unavailable'); return get(key); };
+  const work = store.patch({ projectTags: { p: 'work' } });
+  const rejected = assert.rejects(work, /click read unavailable/);
+  await settle(); f.host.storage.get = get;
+  await f.flush(); await blocked; await rejected;
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'personal', rev: 1 });
+  assert.equal(store.view().projectTags.p, 'personal');
+  const retry = store.patch({ projectTags: { p: 'work' } }); await f.flush(); await retry;
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'work', rev: 2 });
+});
+
+test('legacy timestamp records migrate to revision zero and lose timestamps', async () => {
+  const f = fixture(); f.loading.resolve();
+  f.stored.set('tag:p', { value: 'personal', at: Number.MAX_VALUE });
+  f.stored.set('tag:q', { value: 'work', at: -1 });
+  const loading = loadPrefs(f.host); await f.flush(); await loading;
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'personal', rev: 0 });
+  assert.deepEqual(f.stored.get('tag:q'), { value: 'work', rev: 0 });
+});
+
+test('tag ordering contains no Date usage', () => {
+  for (const file of ['prefs.ts', 'prefsStore.ts']) {
+    assert.doesNotMatch(readFileSync(new URL('../src/store/' + file, import.meta.url), 'utf8'), /\bDate\b/);
+  }
 });

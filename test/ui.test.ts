@@ -251,7 +251,6 @@ test('tabs default to Board, hide empty sources, support arrow keys and persist 
 });
 
 test('Personal and untagged projects never call Cockpit, Work requires email, and retagging persists', async (t) => {
-  let now = 1_800_000_000_000; t.mock.method(Date, 'now', () => ++now);
   const dom = setup(); const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] }); let polls = 0;
   fake.host.serviceRequest = async request => {
     if (request.path.split('?')[0] === '/cockpit-tasks') polls++;
@@ -271,7 +270,7 @@ test('Personal and untagged projects never call Cockpit, Work requires email, an
     assert.equal(selectedTab(dom.root)?.textContent, 'Board');
     t.mock.timers.tick(120000); dom.win.dispatchEvent(new Event('pageshow')); await settle(); assert.equal(polls, 1);
     // Another window's newer Work click may replace this window's Personal choice.
-    fake.stored.set('tag:p', { value: 'work', at: Date.now() }); fake.stored.set('prefs', { projectId: 'p', cockpitEmail: '' }); click(dom.root, 'Refresh'); await settle();
+    fake.stored.set('tag:p', { value: 'work', rev: 100 }); fake.stored.set('prefs', { projectId: 'p', cockpitEmail: '' }); click(dom.root, 'Refresh'); await settle();
     t.mock.timers.tick(120000); await settle(); assert.equal(polls, 1);
     click(dom.root, 'Cockpit'); assert.match(dom.root.querySelector('.kb-cockpit')!.textContent, /Set your Cockpit email/);
     const email = dom.root.querySelector('.kb-cockpit')!.querySelector('input')!;

@@ -43,25 +43,29 @@ export const parsePrefs = (value: unknown): Prefs => {
 
 export const tagKey = (id: string) => `tag:${id}`;
 export const TAG_MIGRATION_KEY = 'tagMigration';
-type TagRecord = { value: ProjectTag | undefined; at: number };
+type TagRecord = { value: ProjectTag | undefined; rev: number };
 const parseTagRecord = (raw: unknown): TagRecord => {
   const record = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : { value: raw };
   return {
     value: record.value === 'work' || record.value === 'personal' ? record.value : undefined,
-    at: typeof record.at === 'number' && Number.isSafeInteger(record.at) && record.at >= 0 && record.at <= Date.now() + 300_000 ? record.at : 0,
+    rev: typeof record.rev === 'number' && Number.isSafeInteger(record.rev) && record.rev >= 0 ? record.rev : 0,
   };
 };
 
 export const loadProjectTag = async (host: Storage, id: string) => parseTagRecord(await host.storage.get(tagKey(id)));
 
-/** Personal always writes; Work and cleanup compare click times after queue delays. */
-export const saveProjectTag = async (host: Storage, id: string, tag: ProjectTag | null, at: number) => {
+/** Personal always writes; Work and cleanup compare revisions captured before queue delays. */
+export const saveProjectTag = async (host: Storage, id: string, tag: ProjectTag | null, expected: number) => {
   const stored = await loadProjectTag(host, id);
-  if (tag !== 'personal' && stored.at >= at) return { tag: stored.value, at: stored.at, conflict: true };
-  if (tag === 'personal') at = Math.max(Date.now(), stored.at + 1);
-  if (tag === null) await host.storage.delete(tagKey(id));
-  else await host.storage.set(tagKey(id), { value: tag, at });
-  return { tag: tag ?? undefined, at, conflict: false };
+  if (tag !== 'personal' && stored.rev !== expected) return { tag: stored.value, rev: stored.rev, conflict: true };
+  if (tag === null) {
+    await host.storage.delete(tagKey(id));
+    return { tag: undefined, rev: 0, conflict: false };
+  }
+  if (stored.rev === Number.MAX_SAFE_INTEGER) throw new Error('Project tag revision exhausted');
+  const rev = stored.rev + 1;
+  await host.storage.set(tagKey(id), { value: tag, rev });
+  return { tag, rev, conflict: false };
 };
 
 export const loadProjectTags = async (host: Storage, ids?: readonly string[]): Promise<Record<string, ProjectTag>> => {
@@ -76,7 +80,7 @@ export const loadPrefs = async (host: Storage): Promise<Prefs> => {
   if (await host.storage.get(TAG_MIGRATION_KEY) !== true) {
     // Existing keys, including malformed values, win over the legacy snapshot.
     for (const [id, tag] of Object.entries(prefs.projectTags)) {
-      if (await host.storage.get(tagKey(id)) == null) await host.storage.set(tagKey(id), { value: tag, at: 0 });
+      if (await host.storage.get(tagKey(id)) == null) await host.storage.set(tagKey(id), { value: tag, rev: 0 });
     }
     await host.storage.set(TAG_MIGRATION_KEY, true);
   }
@@ -84,7 +88,18 @@ export const loadPrefs = async (host: Storage): Promise<Prefs> => {
     // Read again so migration does not replay the other surface's old settings.
     await savePrefs(host, parsePrefs(await host.storage.get(PREFS_KEY)));
   }
-  return { ...prefs, projectTags: await loadProjectTags(host) };
+  // Strip legacy timestamps on a fresh read; never carry them into revision ordering.
+  const keys = (await host.storage.keys()).filter(key => key.startsWith('tag:'));
+  const entries = await Promise.all(keys.map(async key => {
+    const rawTag = await host.storage.get(key);
+    const tag = parseTagRecord(rawTag);
+    if (tag.value !== undefined && rawTag && typeof rawTag === 'object' && Object.hasOwn(rawTag, 'at')) {
+      await host.storage.set(key, { value: tag.value, rev: tag.rev });
+    }
+    return [key.slice(4), tag.value] as const;
+  }));
+  const projectTags = Object.fromEntries(entries.filter((entry): entry is readonly [string, ProjectTag] => entry[1] !== undefined));
+  return { ...prefs, projectTags };
 };
 
 export const savePrefs = (host: Storage, prefs: Prefs) =>

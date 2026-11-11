@@ -158,7 +158,7 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
       cockpit.setPrefs(prefs, projectsReady && hasCockpitScope({ projects, projectId: filter.projectId, projectTags: prefs.projectTags }));
       render();
     }
-  }, () => { if (!disposed) void host.toast({ kind: 'info', message: 'Changed in another window' }).catch(notify); });
+  }, () => { if (!disposed) void host.toast({ kind: 'info', message: 'Changed elsewhere, choose again' }).catch(notify); });
   const patchPrefs = prefsStore.patch;
   let missingTags = new Map<string, number>();
   const pruneProjectTags = () => {
