@@ -7,7 +7,7 @@ import { el } from './dom.ts';
 
 type CockpitPrefs = Pick<Prefs, 'cockpitEmail' | 'cockpitMode' | 'cockpitSubtasks'>;
 export const mountCockpitFeed = (host: Pick<HostClient, 'serviceRequest' | 'toast' | 'openUrl'>, root: Element,
-  onPrefs: (patch: CockpitPrefs) => Promise<void>, onTasks: (tasks: CockpitTask[]) => void, onAvailable: (available: boolean) => void = () => {}) => {
+  onPrefs: (patch: CockpitPrefs) => Promise<void>, onTasks: (tasks: CockpitTask[]) => void, onAvailable: (available: boolean) => void = () => {}, canPoll: () => Promise<boolean> = async () => true) => {
   const section = el('section', 'kb-section kb-cockpit'); section.setAttribute('aria-label', 'Cockpit tasks');
   section.append(el('h2', 'kb-section-title', 'Cockpit'));
   const controls = el('div', 'kb-row');
@@ -63,13 +63,17 @@ export const mountCockpitFeed = (host: Pick<HostClient, 'serviceRequest' | 'toas
   mode.addEventListener('change', changed); subtasks.addEventListener('change', changed);
   const poll = async () => {
     if (!ready || !enabled || !prefs.cockpitEmail || disposed || busy || !frameVisible || document.hidden) return;
-    busy = true; const started = generation;
+    busy = true; const started = generation; let storageAllowed = true;
     try {
+      try { storageAllowed = await canPoll(); if (!storageAllowed) message.textContent = 'Cockpit polling stopped: no verified Work project in this scope.'; }
+      catch { storageAllowed = false; message.textContent = 'Could not verify project type; Cockpit polling stopped.'; }
+      if (!storageAllowed) { result = null; groups.replaceChildren(); onTasks([]); return; }
+      if (disposed || started !== generation || !enabled || !prefs.cockpitEmail || !frameVisible || document.hidden) return;
       const next = await fetchCockpitTasks(host, prefs);
       if (disposed || started !== generation || !enabled || !prefs.cockpitEmail) return;
       result = next;
       onTasks(result.status === 'ok' ? result.tasks : []); render();
-    } finally { busy = false; if (started !== generation) { void poll(); } else if (!disposed && enabled && prefs.cockpitEmail && frameVisible && !document.hidden) timer = setTimeout(() => { void poll(); }, 60_000); }
+    } finally { busy = false; if (started !== generation) { void poll(); } else if (storageAllowed && !disposed && enabled && prefs.cockpitEmail && frameVisible && !document.hidden) timer = setTimeout(() => { void poll(); }, 60_000); }
   };
   const visibility = () => { if (timer) clearTimeout(timer); timer = null; if (frameVisible && !document.hidden) void poll(); };
   const hide = () => { frameVisible = false; visibility(); }; const show = () => { frameVisible = true; visibility(); };

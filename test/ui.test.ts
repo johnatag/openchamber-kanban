@@ -79,7 +79,7 @@ test('refresh requested during import is queued and reloads saved records afterw
     const externallySaved = createTask({ title: 'Saved in another board' }, 0);
     fake.stored.set(`task:${externallySaved.id}`, externallySaved);
     fake.setSessionGate(null); gate.resolve(); await settle();
-    assert.equal(fake.keysCalls, 2);
+    assert.equal(fake.keysCalls, 4);
     assert.match(dom.root.textContent, /Saved in another board/);
   } finally { board.dispose(); }
 });
@@ -90,7 +90,7 @@ test('refresh requested during reload runs one follow-up reload', async () => {
     await settle(); const gate = deferred<void>(); fake.setKeysGate(gate.promise);
     click(dom.root, 'Refresh'); click(dom.root, 'Refresh'); click(dom.root, 'Refresh');
     fake.setKeysGate(null); gate.resolve(); await settle();
-    assert.equal(fake.keysCalls, 3);
+    assert.equal(fake.keysCalls, 6);
   } finally { board.dispose(); }
 });
 
@@ -157,7 +157,7 @@ test('failed optimistic save during import recovers from storage through the que
     assert.match(columns().find((node) => node.dataset.status === 'review')!.textContent, /Existing agent/);
     fake.setSessionGate(null); gate.resolve(); await settle();
     assert.match(columns().find((node) => node.dataset.status === 'in_progress')!.textContent, /Existing agent/);
-    assert.equal(fake.keysCalls, 2);
+    assert.equal(fake.keysCalls, 4);
   } finally { board.dispose(); }
 });
 
@@ -263,12 +263,12 @@ test('Personal and untagged projects never call Cockpit, Work requires email, an
     const tag = dom.root.querySelectorAll('select').find(n => n.getAttribute('aria-label') === 'Project type')!;
     assert.ok(tag); assert.equal(tag.value, 'personal');
     tag.value = 'work'; tag.dispatchEvent(new Event('change')); await settle();
-    assert.equal((fake.stored.get('prefs') as any).projectTags.p, 'work'); assert.equal(polls, 1);
+    assert.equal(fake.stored.get('tag:p'), 'work'); assert.equal(polls, 1);
     click(dom.root, 'Cockpit'); assert.match(dom.root.querySelector('.kb-cockpit')!.textContent, /3 cancelled hidden/);
     tag.value = 'personal'; tag.dispatchEvent(new Event('change')); await settle();
     assert.equal(selectedTab(dom.root)?.textContent, 'Board');
     t.mock.timers.tick(120000); dom.win.dispatchEvent(new Event('pageshow')); await settle(); assert.equal(polls, 1);
-    fake.stored.set('prefs', { projectId: 'p', projectTags: { p: 'work' }, cockpitEmail: '' }); click(dom.root, 'Refresh'); await settle();
+    fake.stored.set('tag:p', 'work'); fake.stored.set('prefs', { projectId: 'p', cockpitEmail: '' }); click(dom.root, 'Refresh'); await settle();
     t.mock.timers.tick(120000); await settle(); assert.equal(polls, 1);
     click(dom.root, 'Cockpit'); assert.match(dom.root.querySelector('.kb-cockpit')!.textContent, /Set your Cockpit email/);
     const email = dom.root.querySelector('.kb-cockpit')!.querySelector('input')!;
@@ -338,7 +338,7 @@ test('failed project tag storage leaves Personal scope intact and surfaces the e
     await settle(); fake.host.storage.set = async () => { throw new Error('Storage unavailable'); };
     const tag = dom.root.querySelectorAll('select').find(n => n.getAttribute('aria-label') === 'Project type')!;
     tag.value = 'work'; tag.dispatchEvent(new Event('change')); await settle();
-    assert.equal(tag.value, 'personal'); assert.equal(polls, 1);
+    assert.equal(tag.value, 'personal'); assert.equal(polls, 0);
     assert.match(dom.root.textContent, /Something went wrong.*Storage unavailable/);
   } finally { board.dispose(); }
 });
@@ -391,7 +391,7 @@ test('REVIEW race: tag Work->Personal then quick tab click; queued tab save pres
   gate.resolve(); await settle();
   for (const [k, v] of queue) fake.stored.set(k, v);
   fake.host.storage.set = origSet;
-  assert.equal((fake.stored.get('prefs') as any).projectTags.p, 'personal');
+  assert.equal(fake.stored.get('tag:p'), 'personal');
   board.dispose();
   const before = polls;
   board = mountKanbanBoard(fake.host, dom.element); await settle();
@@ -423,7 +423,7 @@ test('REVIEW race: Cockpit email save in flight preserves a Work->Personal tag c
   assert.equal(tag.value, 'personal');
   assert.equal(tabs(dom.root).find(n => n.textContent === 'Cockpit')!.hidden, true);
   assert.equal(polls - p1, 0);
-  assert.equal((fake.stored.get('prefs') as any).projectTags.p, 'personal');
+  assert.equal(fake.stored.get('tag:p'), 'personal');
   assert.equal((fake.stored.get('prefs') as any).cockpitEmail, 'other@example.com');
   board.dispose();
 });
@@ -446,20 +446,27 @@ test('Personal stays in memory on failure and Cockpit stays off', async (t) => {
   } finally { board.dispose(); }
 });
 
-test('deleted project tags are pruned only when the project list is ready', async () => {
+test('deleted tags require non-empty ready lists at least ten minutes apart', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 0 });
   const dom = setup(); const fake = fakeHost(); let emit!: (snapshot: any) => void;
   fake.host.onProjects = async listener => { emit ??= listener; listener({ kind: 'projects', state: 'loading', projects: [] }); return () => {}; };
   fake.stored.set('prefs', { projectTags: { p: 'work', gone: 'work' } });
   const board = mountKanbanBoard(fake.host, dom.element);
   try {
-    await settle(); assert.deepEqual((fake.stored.get('prefs') as any).projectTags, { p: 'work', gone: 'work' });
+    await settle(); assert.deepEqual([fake.stored.get('tag:p'), fake.stored.get('tag:gone')], ['work', 'work']);
     emit({ state: 'ready', projects: [{ id: 'p', name: 'Renamed', directory: '/project' }] }); await settle();
-    assert.deepEqual((fake.stored.get('prefs') as any).projectTags, { p: 'work', gone: 'work' });
+    assert.deepEqual([fake.stored.get('tag:p'), fake.stored.get('tag:gone')], ['work', 'work']);
     emit({ state: 'ready', projects: [] }); await settle();
     emit({ state: 'ready', projects: [{ id: 'p', name: 'P', directory: '/project' }] }); await settle();
-    assert.deepEqual((fake.stored.get('prefs') as any).projectTags, { p: 'work', gone: 'work' });
+    assert.deepEqual([fake.stored.get('tag:p'), fake.stored.get('tag:gone')], ['work', 'work']);
     emit({ state: 'ready', projects: [{ id: 'p', name: 'P', directory: '/project' }] }); await settle();
-    assert.deepEqual((fake.stored.get('prefs') as any).projectTags, { p: 'work' });
+    assert.equal(fake.stored.get('tag:gone'), 'work', 'quick repeated snapshots cannot prune');
+    t.mock.timers.tick(599_999);
+    emit({ state: 'ready', projects: [{ id: 'p', name: 'P', directory: '/project' }] }); await settle();
+    assert.equal(fake.stored.get('tag:gone'), 'work');
+    t.mock.timers.tick(1);
+    emit({ state: 'ready', projects: [{ id: 'p', name: 'P', directory: '/project' }] }); await settle();
+    assert.equal(fake.stored.has('tag:gone'), false); assert.equal(fake.stored.get('tag:p'), 'work');
   } finally { board.dispose(); }
 });
 
@@ -494,7 +501,7 @@ test('a refresh started before Personal cannot restore stale loaded preferences'
     const before = polls; gate.resolve(); await settle();
     t.mock.timers.tick(120000); dom.win.dispatchEvent(new Event('pageshow')); await settle();
     assert.equal(tag.value, 'personal'); assert.equal(polls, before);
-    assert.equal((fake.stored.get('prefs') as any).projectTags.p, 'personal');
+    assert.equal(fake.stored.get('tag:p'), 'personal');
   } finally { board.dispose(); }
 });
 
@@ -512,7 +519,7 @@ test('a failed email write rolls back only its fields and the queue still saves 
     tag.value = 'personal'; tag.dispatchEvent(new Event('change'));
     gate.resolve(); await settle();
     const prefs = fake.stored.get('prefs') as any;
-    assert.equal(prefs.projectTags.p, 'personal'); assert.equal(prefs.cockpitEmail, 'me@example.com');
+    assert.equal(fake.stored.get('tag:p'), 'personal'); assert.equal(prefs.cockpitEmail, 'me@example.com');
     assert.equal(tag.value, 'personal'); assert.equal(tabs(dom.root).find(n => n.textContent === 'Cockpit')!.hidden, true);
     assert.match(dom.root.textContent, /Storage unavailable/);
   } finally { board.dispose(); }

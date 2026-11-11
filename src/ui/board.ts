@@ -3,7 +3,7 @@ import { mountBanner, mountButton, mountSearchField, mountSelect, mountSpinner }
 import { applyPatch, createTask, DEFAULT_TASK_TITLE, STATUSES, STATUS_LABELS, type Task, type TaskPatch, type TaskStatus } from '../domain/task.ts';
 import { ALL_PROJECTS, NO_PROJECT, groupColumns, planDrop, rankAtEnd, type BoardFilter } from '../domain/board.ts';
 import { deleteTask, loadTasks, saveTask } from '../store/taskStore.ts';
-import { DEFAULT_PREFS, type Prefs } from '../store/prefs.ts';
+import { DEFAULT_PREFS, loadProjectTags, type Prefs } from '../store/prefs.ts';
 import { createPrefsStore } from '../store/prefsStore.ts';
 import { loadOrphanWatermark, saveOrphanWatermark } from '../store/orphanWatermark.ts';
 import { loadDismissedSessions, saveDismissedSessions } from '../store/dismissedSessions.ts';
@@ -160,12 +160,13 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     }
   });
   const patchPrefs = prefsStore.patch;
-  let missingTags = new Set<string>();
+  let missingTags = new Map<string, number>();
   const pruneProjectTags = () => {
     if (!projectsReady || !projects.length) { missingTags.clear(); return; }
     const missing = new Set(Object.keys(prefs.projectTags).filter(id => !projects.some(project => project.id === id)));
-    const deletions = Object.fromEntries([...missing].filter(id => missingTags.has(id)).map(id => [id, null]));
-    missingTags = missing;
+    const now = Date.now();
+    const deletions = Object.fromEntries([...missing].filter(id => missingTags.has(id) && now - missingTags.get(id)! >= 10 * 60_000).map(id => [id, null]));
+    missingTags = new Map([...missing].map(id => [id, missingTags.get(id) ?? now]));
     if (Object.keys(deletions).length) void patchPrefs({ projectTags: deletions }).catch(notify);
   };
   let cockpitTasks: CockpitTask[] = [];
@@ -848,6 +849,14 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     cockpitHasContent = available;
     tabs.setAvailable('cockpit', available && hasCockpitScope({ projects, projectId: filter.projectId, projectTags: prefs.projectTags }));
     searchWrap.hidden = tabs.selected() !== 'board';
+  }, async () => {
+    const scopeId = filter.projectId;
+    const scopeProjects = scopeId === ALL_PROJECTS ? projects : projects.filter(project => project.id === scopeId);
+    const storedTags = await loadProjectTags(host, scopeProjects.map(project => project.id));
+    if (!projectsReady || scopeId !== filter.projectId) return false;
+    // A project must be Work in both views; a pending Personal intent always wins.
+    const tags = Object.fromEntries(projects.filter(project => prefs.projectTags[project.id] === 'work' && storedTags[project.id] === 'work').map(project => [project.id, 'work' as const]));
+    return hasCockpitScope({ projects, projectId: scopeId, projectTags: tags });
   });
 
   let stopProjects: (() => void) | null = null;

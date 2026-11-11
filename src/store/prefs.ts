@@ -41,7 +41,34 @@ export const parsePrefs = (value: unknown): Prefs => {
   };
 };
 
-export const loadPrefs = async (host: Storage) => parsePrefs(await host.storage.get(PREFS_KEY));
+export const tagKey = (id: string) => `tag:${id}`;
+const parseTag = (value: unknown): ProjectTag | undefined => value === 'work' || value === 'personal' ? value : undefined;
+
+/** Only explicit tag patches (and legacy migration) write tag keys. */
+export const saveProjectTag = async (host: Storage, id: string, tag: ProjectTag | null) => {
+  if (tag === null) await host.storage.delete(tagKey(id));
+  else await host.storage.set(tagKey(id), tag);
+};
+
+export const loadProjectTags = async (host: Storage, ids?: readonly string[]): Promise<Record<string, ProjectTag>> => {
+  const projectIds = ids ?? (await host.storage.keys()).filter(key => key.startsWith('tag:')).map(key => key.slice(4));
+  const entries = await Promise.all(projectIds.map(async id => [id, parseTag(await host.storage.get(tagKey(id)))] as const));
+  return Object.fromEntries(entries.filter((entry): entry is readonly [string, ProjectTag] => entry[1] !== undefined));
+};
+
+export const loadPrefs = async (host: Storage): Promise<Prefs> => {
+  const raw = await host.storage.get(PREFS_KEY);
+  const prefs = parsePrefs(raw);
+  // Existing keys, including malformed values, win over the legacy snapshot.
+  for (const [id, tag] of Object.entries(prefs.projectTags)) {
+    if (await host.storage.get(tagKey(id)) == null) await saveProjectTag(host, id, tag);
+  }
+  if (raw && typeof raw === 'object' && Object.hasOwn(raw, 'projectTags')) {
+    // Read again so migration does not replay the other surface's old settings.
+    await savePrefs(host, parsePrefs(await host.storage.get(PREFS_KEY)));
+  }
+  return { ...prefs, projectTags: await loadProjectTags(host) };
+};
 
 export const savePrefs = (host: Storage, prefs: Prefs) =>
-  host.storage.set(PREFS_KEY, { activeTab: prefs.activeTab, projectTags: prefs.projectTags, projectId: prefs.projectId, query: prefs.query, openTaskId: prefs.openTaskId, cockpitEmail: prefs.cockpitEmail, cockpitMode: prefs.cockpitMode, cockpitSubtasks: prefs.cockpitSubtasks });
+  host.storage.set(PREFS_KEY, { activeTab: prefs.activeTab, projectId: prefs.projectId, query: prefs.query, openTaskId: prefs.openTaskId, cockpitEmail: prefs.cockpitEmail, cockpitMode: prefs.cockpitMode, cockpitSubtasks: prefs.cockpitSubtasks });

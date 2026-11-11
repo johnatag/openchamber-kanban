@@ -1,4 +1,4 @@
-import { DEFAULT_PREFS, loadPrefs, savePrefs, type Prefs, type ProjectTag } from './prefs.ts';
+import { DEFAULT_PREFS, loadPrefs, savePrefs, saveProjectTag, type Prefs, type ProjectTag } from './prefs.ts';
 
 type Host = Parameters<typeof loadPrefs>[0];
 export type PrefsPatch = Partial<Omit<Prefs, 'projectTags'>> & { projectTags?: Record<string, ProjectTag | null> };
@@ -18,7 +18,10 @@ export const createPrefsStore = (host: Host, changed: (prefs: Prefs) => void = (
   let loaded = false;
   let revision = 0;
   let queue: Promise<void> = Promise.resolve();
-  const view = () => pending.reduce(apply, saved);
+  // Work only takes effect once confirmed; Personal takes effect immediately.
+  const view = () => pending.reduce<Prefs>((prefs, patch) => apply(prefs, {
+    ...patch, projectTags: Object.fromEntries(Object.entries(patch.projectTags ?? {}).filter(([, tag]) => tag !== 'work')),
+  }), saved);
   const publish = () => changed(view());
   const load = (): Promise<void> => {
     if (loaded) return Promise.resolve();
@@ -34,8 +37,12 @@ export const createPrefsStore = (host: Host, changed: (prefs: Prefs) => void = (
       try {
         await load();
         const end = pending.indexOf(entry);
-        const value = pending.slice(0, end + 1).reduce(apply, saved);
-        await savePrefs(host, value);
+        const patches = pending.slice(0, end + 1);
+        const value = patches.reduce(apply, await loadPrefs(host));
+        // Only fields this instance actually changed can be written.
+        const tagChanges = Object.assign({}, ...patches.map(patch => patch.projectTags ?? {})) as Record<string, ProjectTag | null>;
+        for (const [id, tag] of Object.entries(tagChanges)) await saveProjectTag(host, id, tag);
+        if (patches.some(patch => Object.keys(patch).some(key => key !== 'projectTags'))) await savePrefs(host, value);
         saved = value;
         pending.splice(0, end + 1);
       } catch (error) {

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import type { HostClient, JsonValue } from '@openchamber/sdk';
 import { createTask } from '../src/domain/task.ts';
 import { deleteTask, loadTasks, saveTask, taskKey } from '../src/store/taskStore.ts';
-import { DEFAULT_PREFS, loadPrefs, savePrefs, parsePrefs } from '../src/store/prefs.ts';
+import { DEFAULT_PREFS, saveProjectTag, loadPrefs, savePrefs, parsePrefs } from '../src/store/prefs.ts';
 import { DISMISSED_SESSIONS_KEY, loadDismissedSessions, saveDismissedSessions } from '../src/store/dismissedSessions.ts';
 
 /** In-memory stand-in for host.storage that serializes like the host (JSON, 64 KiB per value). */
@@ -99,6 +99,7 @@ test('tab and project tags persist, while malformed preferences default to Board
   const { host } = fakeHost();
   const prefs = { ...DEFAULT_PREFS, activeTab: 'cockpit' as const, projectTags: { p: 'work' as const, home: 'personal' as const } };
   await savePrefs(host, prefs);
+  for (const [id, tag] of Object.entries(prefs.projectTags)) await saveProjectTag(host, id, tag);
   assert.deepEqual(await loadPrefs(host), prefs);
   const parsed = parsePrefs({ activeTab: 'unknown', projectTags: { p: 'work', home: 'personal', bad: 'WORK', other: null } });
   assert.equal(parsed.activeTab, 'board');

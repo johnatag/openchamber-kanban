@@ -180,3 +180,26 @@ test('hanging MCP DELETE never holds a read or subsequent refresh open', async (
     assert.ok(signal); assert.equal(signal.aborted, false);
   } finally { await f.cleanup(); }
 });
+
+
+test('service logs never contain Cockpit request URLs or filter emails, including failures', async (t) => {
+  const logs: unknown[][] = [];
+  for (const method of ['log', 'info', 'warn', 'error', 'debug'] as const) t.mock.method(console, method, (...args: unknown[]) => { logs.push(args); });
+  const f = await fixture();
+  const email = 'private-person@example.com';
+  const url = 'http://local-service/cockpit-tasks?email=' + encodeURIComponent(email) + '&mode=mine&subtasks=false';
+  const readers = [createCockpitReader({ fetch: f.fetch }), createCockpitReader({ fetch: async () => { throw new Error(url); } })];
+  try {
+    for (const reader of readers) {
+      const server = createServiceServer('local-token', '/missing', reader); const request = serverFetch(server);
+      try {
+        assert.equal((await request(url)).status, 401);
+        assert.equal((await request(url + '&extra=bad', { headers: { authorization: 'Bearer local-token' } })).status, 400);
+        const response = await request(url, { headers: { authorization: 'Bearer local-token' } });
+        assert.equal(response.status, 200); await response.json();
+      } finally { await close(server); }
+    }
+    const output = JSON.stringify(logs, (_key, value) => value instanceof Error ? value.message : value);
+    for (const secret of [email, encodeURIComponent(email), url, '/cockpit-tasks']) assert.equal(output.includes(secret), false);
+  } finally { await f.cleanup(); }
+});

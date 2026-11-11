@@ -65,7 +65,7 @@ const tagSel = (root: DomNode) => root.querySelectorAll('select').find(n => n.ge
 // Storage whose 'prefs' writes wait on a gate each, completing in issue order unless told otherwise.
 const gatedPrefs = (fake: ReturnType<typeof fakeHost>) => {
   const orig = fake.host.storage.set; const pending: { value: unknown; g: ReturnType<typeof deferred<void>>; fail: boolean }[] = [];
-  fake.host.storage.set = (async (key: string, value: unknown) => { if (key !== 'prefs') return orig(key, value as any); const p = { value: structuredClone(value), g: deferred<void>(), fail: false }; pending.push(p); await p.g.promise; if (p.fail) throw new Error('Storage unavailable'); fake.stored.set(key, p.value); }) as any;
+  fake.host.storage.set = (async (key: string, value: unknown) => { if (key !== 'prefs' && !key.startsWith('tag:')) return orig(key, value as any); const p = { value: structuredClone(value), g: deferred<void>(), fail: false }; pending.push(p); await p.g.promise; if (p.fail) throw new Error('Storage unavailable'); fake.stored.set(key, p.value); }) as any;
   return { pending, restore: () => { fake.host.storage.set = orig; } };
 };
 const flush = async (q: { pending: any[] }, fail: number[] = []) => { for (let i = 0; i < 20; i++) { const p = q.pending.find((x: any) => !x.done); if (!p) break; p.done = true; p.fail = fail.includes(q.pending.indexOf(p)); p.g.resolve(); await settle(); } };
