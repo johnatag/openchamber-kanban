@@ -6,7 +6,7 @@ export type CockpitTask = {
   parentTaskKey: string | null; prUrl: string | null; updatedAt: string;
   estimateHours: number | null; spentHours: number | null;
 };
-export type CockpitResponse = { status: 'ok'; tasks: CockpitTask[] } | { status: 'unavailable'; reason: string };
+export type CockpitResponse = { status: 'ok'; tasks: CockpitTask[]; cancelledHidden?: number } | { status: 'unavailable'; reason: string };
 export type CockpitMode = 'mine' | 'all_in_progress';
 const keyPattern = /^[A-Z]{2,6}-\d+(\.\d+)*$/;
 const text = (v: unknown, max = 4096): v is string => typeof v === 'string' && v.length <= max;
@@ -42,6 +42,6 @@ export const filterCockpitTasks = (tasks: readonly CockpitTask[], email: string,
     (mode === 'all_in_progress' ? t.status === 'in_progress' : normalized !== '' && t.assignees.some(a => a.email.trim().toLowerCase() === normalized)));
 };
 export const linkedCockpitTasks = (tasks: readonly CockpitTask[], ...sources: (string | null | undefined)[]) => {
-  const keys = new Set(sources.flatMap(s => [...(s ?? '').matchAll(/(?<![A-Za-z0-9_.])[A-Z]{2,6}-\d+(?:\.\d+)*(?![A-Za-z0-9_.])/g)].map(m => m[0])));
+  const keys = new Set(sources.flatMap(s => [...(s ?? '').matchAll(/(?<![A-Za-z0-9])[A-Z]{2,6}-\d+(?:\.\d+)*(?![A-Za-z0-9]|\.\d)/gi)].map(m => m[0].toUpperCase())));
   return tasks.filter(t => keys.has(t.key));
 };

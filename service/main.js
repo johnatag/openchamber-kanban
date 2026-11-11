@@ -85,9 +85,10 @@ var createCockpitReader = (options = {}) => {
   const refresh = async () => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 15e3);
+    let key = null;
+    let session = null;
     try {
-      const key = await readKey();
-      let session = null;
+      key = await readKey();
       const rpc = async (method, params, id) => {
         const response = await request(ENDPOINT, {
           method: "POST",
@@ -190,7 +191,9 @@ var createCockpitReader = (options = {}) => {
         return fail("Cockpit returned invalid task records");
       }
       if (JSON.stringify(tasks).includes(JSON.stringify(key).slice(1, -1))) return fail("Cockpit returned unsafe task data");
-      cached = { status: "ok", tasks };
+      const records = record(payload) ? payload.tasks : payload;
+      const cancelledHidden = records.filter((task) => task.cancelledAt != null).length;
+      cached = { status: "ok", tasks, cancelledHidden };
       expires = now() + 6e4;
       return cached;
     } catch (error) {
@@ -198,6 +201,18 @@ var createCockpitReader = (options = {}) => {
       return { status: "unavailable", reason: controller.signal.aborted ? "Cockpit request timed out" : error instanceof CockpitError ? error.message : "Cockpit network request failed" };
     } finally {
       clearTimeout(timer);
+      if (session && key) {
+        try {
+          const response = await request(ENDPOINT, {
+            method: "DELETE",
+            redirect: "error",
+            signal: AbortSignal.timeout(options.timeoutMs ?? 15e3),
+            headers: { Authorization: `Bearer ${key}`, "Mcp-Session-Id": session, "MCP-Protocol-Version": VERSION }
+          });
+          await response.body?.cancel();
+        } catch {
+        }
+      }
     }
   };
   return () => {

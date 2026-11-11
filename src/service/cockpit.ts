@@ -42,9 +42,10 @@ export const createCockpitReader = (options: { fetch?: typeof fetch; now?: () =>
   const refresh = async (): Promise<CockpitResponse> => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 15_000);
+    let key: string | null = null;
+    let session: string | null = null;
     try {
-      const key = await readKey();
-      let session: string | null = null;
+      key = await readKey();
       const rpc = async (method: string, params?: unknown, id?: number): Promise<any> => {
         const response = await request(ENDPOINT, { method: 'POST', redirect: 'error', signal: controller.signal,
           headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream',
@@ -107,12 +108,23 @@ export const createCockpitReader = (options: { fetch?: typeof fetch; now?: () =>
       try { tasks = slimCockpitTasks(record(payload) ? payload.tasks : payload); } catch { return fail('Cockpit returned invalid task records'); }
       // Even a remote server reflecting credentials in a projected field must not expose them.
       if (JSON.stringify(tasks).includes(JSON.stringify(key).slice(1, -1))) return fail('Cockpit returned unsafe task data');
-      cached = { status: 'ok', tasks }; expires = now() + 60_000;
+      const records = record(payload) ? payload.tasks : payload;
+      const cancelledHidden = (records as Record<string, unknown>[]).filter(task => task.cancelledAt != null).length;
+      cached = { status: 'ok', tasks, cancelledHidden }; expires = now() + 60_000;
       return cached;
     } catch (error) {
       cached = null;
       return { status: 'unavailable', reason: controller.signal.aborted ? 'Cockpit request timed out' : error instanceof CockpitError ? error.message : 'Cockpit network request failed' };
-    } finally { clearTimeout(timer); }
+    } finally {
+      clearTimeout(timer);
+      if (session && key) {
+        try {
+          const response = await request(ENDPOINT, { method: 'DELETE', redirect: 'error', signal: AbortSignal.timeout(options.timeoutMs ?? 15_000),
+            headers: { Authorization: `Bearer ${key}`, 'Mcp-Session-Id': session, 'MCP-Protocol-Version': VERSION } });
+          await response.body?.cancel();
+        } catch { /* Session termination is best-effort, including servers that do not support DELETE. */ }
+      }
+    }
   };
   return (): Promise<CockpitResponse> => {
     if (flight) return flight;

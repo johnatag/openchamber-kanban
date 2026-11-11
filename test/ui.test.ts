@@ -166,18 +166,20 @@ test('Cockpit prompts for email, saves prefs, filters and links board/Harness ke
   const base = { key: 'COC-385', title: 'Cockpit work', status: 'in_review', priority: 'high', assignees: [{ email: 'me@example.com', name: 'Me' }], parentTaskKey: null, prUrl: 'https://github.com/team/repo/pull/1', updatedAt: '2026-11-11T12:00:00Z', estimateHours: 3, spentHours: 1 };
   const remote = slimCockpitTasks([base, { ...base, key: 'COC-385.2', title: 'Child work', parentTaskKey: 'COC-385' }, { ...base, key: 'COC-40', title: 'Other work', assignees: [], status: 'in_progress' }]);
   fake.host.openUrl = async url => { opened.push(url); };
-  fake.host.serviceRequest = async request => ({ status: 200, body: JSON.stringify(request.path === '/cockpit-tasks' ? { status: 'ok', tasks: remote } : { file: 'ok', lanes: [{ v: 1, id: 'lane', title: 'Review COC-385.2', branch: 'feat/COC-40', project: null, kind: 'review', pid: 1, startedAt: '2026-11-11T12:00:00Z', report: null, log: null, status: 'review', reportFile: null, logFile: null }], rejected: 0, rejectedLines: [], truncated: false }) });
-  const local = createTask({ title: 'Local work', sourceBranch: 'feat/COC-385' }, 1); fake.stored.set(`task:${local.id}`, local);
+  fake.host.serviceRequest = async request => ({ status: 200, body: JSON.stringify(request.path === '/cockpit-tasks' ? { status: 'ok', tasks: remote } : { file: 'ok', lanes: [{ v: 1, id: 'lane', title: 'Review COC-385.2', branch: 'feat/COC-40', project: '/project', kind: 'review', pid: 1, startedAt: '2026-11-11T12:00:00Z', report: null, log: null, status: 'review', reportFile: null, logFile: null }], rejected: 0, rejectedLines: [], truncated: false }) });
+  fake.stored.set('prefs', { projectTags: { p: 'work' } });
+  const local = createTask({ title: 'Local work', projectId: 'p', sourceBranch: 'feat/COC-385' }, 1); fake.stored.set(`task:${local.id}`, local);
   const board = mountKanbanBoard(fake.host, dom.element);
   try {
     await settle(); const section = dom.root.querySelector('.kb-cockpit')!;
     assert.match(section.textContent, /Set your Cockpit email/); assert.ok(!section.textContent.includes('Cockpit work'));
-    assert.match(dom.root.querySelector('.kb-harness')!.textContent, /COC-385.2 · in_review/);
-    assert.match(dom.root.querySelector('.kb-harness')!.textContent, /COC-40 · in_progress/);
-    assert.match(dom.root.querySelector('.kb-columns')!.textContent, /COC-385 · in_review/);
     const email = section.querySelector('input')!; Object.assign(email, { value: 'ME@example.com', validity: { valid: true } });
     click(section, 'Save email'); await settle();
     assert.equal((fake.stored.get('prefs') as any).cockpitEmail, 'me@example.com');
+    assert.match(dom.root.querySelector('.kb-harness')!.textContent, /COC-385.2 · in_review/);
+    assert.match(dom.root.querySelector('.kb-harness')!.textContent, /COC-40 · in_progress/);
+    assert.match(dom.root.querySelector('.kb-columns')!.textContent, /COC-385 · in_review/);
+
     assert.match(section.textContent, /Cockpit work/); assert.match(section.textContent, /1\/3h/); assert.ok(!section.textContent.includes('Child work')); assert.ok(!section.textContent.includes('Other work'));
     click(section, 'Open PR'); await settle(); assert.deepEqual(opened, [base.prUrl]);
     click(section, 'Copy key'); await settle(); assert.deepEqual(fake.toasts, ['Copy Cockpit key']);
@@ -194,6 +196,7 @@ test('Cockpit polls every 60 seconds, pauses on both visibility hooks, clears st
   let polls = 0; const snapshots: unknown[] = []; let fail = false;
   fake.host.serviceRequest = async () => { polls++; return { status: 200, body: JSON.stringify(fail ? { status: 'unavailable', reason: 'Cockpit authentication failed' } : { status: 'ok', tasks: [] }) }; };
   const feed = mountCockpitFeed(fake.host, dom.element, async () => {}, tasks => { snapshots.push(tasks); });
+  feed.setEnabled(true);
   feed.setPrefs({ cockpitEmail: 'me@example.com', cockpitMode: 'mine', cockpitSubtasks: false });
   await settle(); assert.equal(polls, 1);
   t.mock.timers.tick(59_999); await settle(); assert.equal(polls, 1);
@@ -203,4 +206,151 @@ test('Cockpit polls every 60 seconds, pauses on both visibility hooks, clears st
   dom.doc.hidden = true; dom.doc.dispatchEvent(new Event('visibilitychange')); t.mock.timers.tick(120_000); await settle(); assert.equal(polls, 3);
   dom.doc.hidden = false; dom.doc.dispatchEvent(new Event('visibilitychange')); await settle(); assert.equal(polls, 4);
   feed.dispose(); dom.win.dispatchEvent(new Event('pageshow')); t.mock.timers.tick(120_000); await settle(); assert.equal(polls, 4);
+});
+
+const tabs = (root: DomNode) => root.querySelectorAll('button').filter(node => node.getAttribute('role') === 'tab');
+const selectedTab = (root: DomNode) => tabs(root).find(node => node.getAttribute('aria-selected') === 'true');
+const setScope = async (fake: ReturnType<typeof fakeHost>, root: DomNode, projectId: string) => {
+  fake.stored.set('prefs', { ...(fake.stored.get('prefs') as object), projectId });
+  click(root, 'Refresh'); await settle();
+};
+const harnessLane = (id: string, project: string | null) => ({ v: 1, id, title: id, project, branch: 'feat/COC-12', kind: 'review', pid: 1, startedAt: '2026-11-11T12:00:00Z', report: null, log: null, status: 'review', reportFile: null, logFile: null });
+
+test('tabs default to Board, hide empty sources, support arrow keys and persist the selection', async () => {
+  const dom = setup(); const fake = fakeHost();
+  fake.host.serviceRequest = async () => ({ status: 200, body: JSON.stringify({ file: 'ok', lanes: [harnessLane('Lane', '/project/sub')], rejected: 0, rejectedLines: [], truncated: false }) });
+  let board = mountKanbanBoard(fake.host, dom.element);
+  try {
+    await settle();
+    assert.equal(selectedTab(dom.root)?.textContent, 'Board');
+    assert.ok(tabs(dom.root).find(t => t.textContent === 'Cockpit')?.hidden);
+    assert.equal(dom.root.querySelectorAll('div').filter(n => n.getAttribute('role') === 'tablist').length, 1);
+    const boardTab = selectedTab(dom.root)!;
+    boardTab.dispatchEvent(Object.assign(new Event('keydown', { cancelable: true }), { key: 'ArrowRight' })); await settle();
+    assert.equal(selectedTab(dom.root)?.textContent, 'Harness');
+    assert.equal((fake.stored.get('prefs') as any).activeTab, 'harness');
+    for (const tab of tabs(dom.root)) {
+      const panel = dom.root.querySelectorAll('div').find(node => node.id === tab.getAttribute('aria-controls'))!;
+      assert.equal(panel.getAttribute('role'), 'tabpanel');
+      assert.equal(panel.getAttribute('aria-labelledby'), tab.id);
+      assert.equal(panel.hidden, tab.getAttribute('aria-selected') !== 'true');
+    }
+    selectedTab(dom.root)!.dispatchEvent(Object.assign(new Event('keydown'), { key: 'ArrowRight' })); await settle();
+    assert.equal(selectedTab(dom.root)?.textContent, 'Board');
+    click(dom.root, 'Harness'); await settle(); board.dispose();
+    board = mountKanbanBoard(fake.host, dom.element); await settle();
+    assert.equal(selectedTab(dom.root)?.textContent, 'Harness');
+    await setScope(fake, dom.root, 'missing-project');
+    assert.equal(selectedTab(dom.root)?.textContent, 'Board');
+    assert.ok(tabs(dom.root).find(t => t.textContent === 'Harness')?.hidden);
+  } finally { board.dispose(); }
+});
+
+test('Personal and untagged projects never call Cockpit, Work requires email, and retagging persists', async (t) => {
+  const dom = setup(); const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] }); let polls = 0;
+  fake.host.serviceRequest = async request => {
+    if (request.path === '/cockpit-tasks') polls++;
+    return { status: 200, body: JSON.stringify(request.path === '/cockpit-tasks' ? { status: 'ok', tasks: [], cancelledHidden: 3 } : { file: 'missing', lanes: [], rejected: 0, rejectedLines: [], truncated: false }) };
+  };
+  fake.stored.set('prefs', { cockpitEmail: 'me@example.com' });
+  const board = mountKanbanBoard(fake.host, dom.element);
+  try {
+    await settle(); t.mock.timers.tick(120000); await settle(); assert.equal(polls, 0);
+    await setScope(fake, dom.root, 'p'); assert.equal(polls, 0);
+    const tag = dom.root.querySelectorAll('select').find(n => n.getAttribute('aria-label') === 'Project type')!;
+    assert.ok(tag); assert.equal(tag.value, 'personal');
+    tag.value = 'work'; tag.dispatchEvent(new Event('change')); await settle();
+    assert.equal((fake.stored.get('prefs') as any).projectTags.p, 'work'); assert.equal(polls, 1);
+    click(dom.root, 'Cockpit'); assert.match(dom.root.querySelector('.kb-cockpit')!.textContent, /3 cancelled hidden/);
+    tag.value = 'personal'; tag.dispatchEvent(new Event('change')); await settle();
+    assert.equal(selectedTab(dom.root)?.textContent, 'Board');
+    t.mock.timers.tick(120000); dom.win.dispatchEvent(new Event('pageshow')); await settle(); assert.equal(polls, 1);
+    fake.stored.set('prefs', { projectId: 'p', projectTags: { p: 'work' }, cockpitEmail: '' }); click(dom.root, 'Refresh'); await settle();
+    t.mock.timers.tick(120000); await settle(); assert.equal(polls, 1);
+    click(dom.root, 'Cockpit'); assert.match(dom.root.querySelector('.kb-cockpit')!.textContent, /Set your Cockpit email/);
+    const email = dom.root.querySelector('.kb-cockpit')!.querySelector('input')!;
+    Object.assign(email, { value: 'me@example.com', validity: { valid: true } }); click(dom.root, 'Save email'); await settle(); assert.equal(polls, 2);
+    await setScope(fake, dom.root, '__all__'); t.mock.timers.tick(60000); await settle(); assert.ok(polls > 2);
+    await setScope(fake, dom.root, '__none__'); const before = polls; t.mock.timers.tick(120000); await settle(); assert.equal(polls, before);
+  } finally { board.dispose(); }
+});
+
+test('Harness paths follow project filters, nested project ownership and unmatched lanes only appear in All projects', async () => {
+  const dom = setup(); const fake = fakeHost();
+  fake.host.onProjects = async listener => { listener({ kind: 'projects', state: 'ready', projects: [{ id: 'p', name: 'Work', directory: '/project' }, { id: 'nested', name: 'Personal', directory: '/project/home' }] }); return () => {}; };
+  fake.stored.set('prefs', { projectTags: { p: 'work', nested: 'personal' } });
+  fake.host.serviceRequest = async () => ({ status: 200, body: JSON.stringify({ file: 'ok', lanes: [harnessLane('Root lane', '/project'), harnessLane('Child lane', '/project/child'), harnessLane('Personal lane', '/project/home/sub'), harnessLane('Prefix lane', '/projects'), harnessLane('Unknown lane', '/elsewhere'), harnessLane('No project lane', null)], rejected: 0, rejectedLines: [], truncated: false }) });
+  const board = mountKanbanBoard(fake.host, dom.element);
+  try {
+    await settle(); const titles = () => dom.root.querySelector('.kb-harness')!.querySelectorAll('.kb-card-title').map(n => n.textContent);
+    assert.equal(titles().length, 6);
+    await setScope(fake, dom.root, 'p'); assert.deepEqual(titles(), ['Root lane', 'Child lane']);
+    await setScope(fake, dom.root, 'nested'); assert.deepEqual(titles(), ['Personal lane']);
+    await setScope(fake, dom.root, '__none__'); assert.deepEqual(titles(), []);
+    assert.ok(tabs(dom.root).find(t => t.textContent === 'Harness')?.hidden);
+  } finally { board.dispose(); }
+});
+
+test('board Cockpit badges only annotate Work cards even in All projects', async () => {
+  const dom = setup(); const fake = fakeHost();
+  fake.stored.set('prefs', { cockpitEmail: 'me@example.com', projectTags: { p: 'work' } });
+  for (const [title, projectId] of [['Work card', 'p'], ['Personal card', 'home'], ['Untagged card', null]] as const) {
+    const task = createTask({ title, projectId, sourceBranch: 'feat/coc-12_fix' }, 1); fake.stored.set(`task:${task.id}`, task);
+  }
+  fake.host.serviceRequest = async request => ({ status: 200, body: JSON.stringify(request.path === '/cockpit-tasks' ? { status: 'ok', tasks: [{ key: 'COC-12', title: 'Remote', status: 'in_review', priority: null, assignees: [], parentTaskKey: null, prUrl: null, updatedAt: '2026-11-11T12:00:00Z', estimateHours: null, spentHours: null }] } : { file: 'missing', lanes: [], rejected: 0, rejectedLines: [], truncated: false }) });
+  const board = mountKanbanBoard(fake.host, dom.element);
+  try {
+    await settle(); const cards = dom.root.querySelector('.kb-columns')!.querySelectorAll('.kb-card');
+    assert.match(cards.find(c => c.textContent.includes('Work card'))!.textContent, /COC-12 · in_review/);
+    for (const title of ['Personal card', 'Untagged card']) assert.ok(!cards.find(c => c.textContent.includes(title))!.textContent.includes('COC-12 ·'));
+  } finally { board.dispose(); }
+});
+
+test('scope changes discard in-flight Cockpit data and never restart polling in Personal scope', async (t) => {
+  const dom = setup(); const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] });
+  fake.stored.set('prefs', { projectTags: { p: 'work' }, cockpitEmail: 'me@example.com' });
+  const gate = deferred<void>(); let polls = 0;
+  fake.host.serviceRequest = async request => {
+    if (request.path !== '/cockpit-tasks') return { status: 200, body: JSON.stringify({ file: 'missing', lanes: [], rejected: 0, rejectedLines: [], truncated: false }) };
+    polls++; await gate.promise;
+    return { status: 200, body: JSON.stringify({ status: 'ok', tasks: [], cancelledHidden: 9 }) };
+  };
+  const board = mountKanbanBoard(fake.host, dom.element);
+  try {
+    await settle(); assert.equal(polls, 1);
+    await setScope(fake, dom.root, '__none__'); gate.resolve(); await settle();
+    assert.ok(!dom.root.querySelector('.kb-cockpit')!.textContent.includes('9 cancelled hidden'));
+    t.mock.timers.tick(120000); dom.win.dispatchEvent(new Event('pageshow')); await settle(); assert.equal(polls, 1);
+    await setScope(fake, dom.root, 'p'); await settle(); assert.equal(polls, 2);
+    assert.match(dom.root.querySelector('.kb-cockpit')!.textContent, /9 cancelled hidden/);
+  } finally { board.dispose(); }
+});
+
+test('failed project tag storage leaves Personal scope intact and surfaces the error', async () => {
+  const dom = setup(); const fake = fakeHost(); let polls = 0;
+  fake.stored.set('prefs', { projectId: 'p', cockpitEmail: 'me@example.com' });
+  fake.host.serviceRequest = async request => { if (request.path === '/cockpit-tasks') polls++; return { status: 200, body: JSON.stringify({ file: 'missing', lanes: [], rejected: 0, rejectedLines: [], truncated: false }) }; };
+  const board = mountKanbanBoard(fake.host, dom.element);
+  try {
+    await settle(); fake.host.storage.set = async () => { throw new Error('Storage unavailable'); };
+    const tag = dom.root.querySelectorAll('select').find(n => n.getAttribute('aria-label') === 'Project type')!;
+    tag.value = 'work'; tag.dispatchEvent(new Event('change')); await settle();
+    assert.equal(tag.value, 'personal'); assert.equal(polls, 0);
+    assert.match(dom.root.textContent, /Something went wrong.*Storage unavailable/);
+  } finally { board.dispose(); }
+});
+
+test('Cockpit hides a successfully empty source and reappears when polling finds work', async (t) => {
+  const dom = setup(); const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] }); let cancelledHidden = 0;
+  fake.stored.set('prefs', { projectTags: { p: 'work' }, cockpitEmail: 'me@example.com', activeTab: 'cockpit' });
+  fake.host.serviceRequest = async request => ({ status: 200, body: JSON.stringify(request.path === '/cockpit-tasks' ? { status: 'ok', tasks: [], cancelledHidden } : { file: 'missing', lanes: [], rejected: 0, rejectedLines: [], truncated: false }) });
+  const board = mountKanbanBoard(fake.host, dom.element);
+  try {
+    await settle(); assert.ok(tabs(dom.root).find(n => n.textContent === 'Cockpit')!.hidden);
+    assert.equal(selectedTab(dom.root)?.textContent, 'Board');
+    cancelledHidden = 2; t.mock.timers.tick(60000); await settle();
+    assert.equal(tabs(dom.root).find(n => n.textContent === 'Cockpit')!.hidden, false);
+    assert.equal(selectedTab(dom.root)?.textContent, 'Cockpit');
+    assert.match(dom.root.querySelector('.kb-cockpit')!.textContent, /2 cancelled hidden/);
+  } finally { board.dispose(); }
 });

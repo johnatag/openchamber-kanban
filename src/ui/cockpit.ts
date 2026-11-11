@@ -7,7 +7,7 @@ import { el } from './dom.ts';
 
 type CockpitPrefs = Pick<Prefs, 'cockpitEmail' | 'cockpitMode' | 'cockpitSubtasks'>;
 export const mountCockpitFeed = (host: Pick<HostClient, 'serviceRequest' | 'toast' | 'openUrl'>, root: Element,
-  onPrefs: (patch: CockpitPrefs) => Promise<void>, onTasks: (tasks: CockpitTask[]) => void) => {
+  onPrefs: (patch: CockpitPrefs) => Promise<void>, onTasks: (tasks: CockpitTask[]) => void, onAvailable: (available: boolean) => void = () => {}) => {
   const section = el('section', 'kb-section kb-cockpit'); section.setAttribute('aria-label', 'Cockpit tasks');
   section.append(el('h2', 'kb-section-title', 'Cockpit'));
   const controls = el('div', 'kb-row');
@@ -21,15 +21,17 @@ export const mountCockpitFeed = (host: Pick<HostClient, 'serviceRequest' | 'toas
   const groups = el('div', 'kb-columns'); section.append(message, groups); root.append(section);
   let prefs: CockpitPrefs = { cockpitEmail: '', cockpitMode: 'mine', cockpitSubtasks: false };
   let result: CockpitResponse | null = null;
+  let enabled = false; let generation = 0;
   let disposed = false; let busy = false; let frameVisible = true; let ready = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
   const render = () => {
     groups.replaceChildren();
+    onAvailable(!prefs.cockpitEmail || !result || result.status === 'unavailable' || result.tasks.some(task => task.status !== 'done') || (result.cancelledHidden ?? 0) > 0);
     if (!prefs.cockpitEmail) { message.textContent = 'Set your Cockpit email to see your work.' + (result?.status === 'unavailable' ? ' Cockpit unavailable: ' + result.reason : ''); return; }
     if (!result) { message.textContent = 'Loading Cockpit tasks…'; return; }
     if (result.status === 'unavailable') { message.textContent = 'Cockpit unavailable: ' + result.reason; return; }
     const visible = filterCockpitTasks(result.tasks, prefs.cockpitEmail, prefs.cockpitMode, prefs.cockpitSubtasks);
-    message.textContent = visible.length ? 'Read-only · updated every 60 seconds' : 'No matching open Cockpit tasks';
+    message.textContent = (visible.length ? 'Read-only · updated every 60 seconds' : 'No matching open Cockpit tasks') + (result.cancelledHidden ? ' · ' + result.cancelledHidden + ' cancelled hidden' : '');
     for (const status of COCKPIT_STATUSES) {
       const tasks = visible.filter(t => t.status === status); if (!tasks.length) continue;
       const group = el('div', 'kb-column'); group.append(el('h3', 'kb-column-head', status.replaceAll('_', ' ')));
@@ -54,25 +56,38 @@ export const mountCockpitFeed = (host: Pick<HostClient, 'serviceRequest' | 'toas
   const changed = () => {
     if (!email.validity.valid || !email.value.trim()) { message.textContent = 'Enter a valid Cockpit email.'; return; }
     const next: CockpitPrefs = { cockpitEmail: email.value.trim().toLowerCase(), cockpitMode: mode.value === 'all_in_progress' ? 'all_in_progress' : 'mine', cockpitSubtasks: subtasks.checked };
-    void onPrefs(next).then(() => { if (!disposed) { prefs = next; updateControls(); } }, () => { if (!disposed) message.textContent = 'Could not save Cockpit preferences'; });
+    void onPrefs(next).then(() => { if (!disposed) { setPrefs(next); } }, () => { if (!disposed) message.textContent = 'Could not save Cockpit preferences'; });
   };
   mountButton(controls, { label: 'Save email', variant: 'secondary', onClick: changed });
   mode.addEventListener('change', changed); subtasks.addEventListener('change', changed);
   const poll = async () => {
-    if (!ready || disposed || busy || !frameVisible || document.hidden) return;
-    busy = true;
+    if (!ready || !enabled || !prefs.cockpitEmail || disposed || busy || !frameVisible || document.hidden) return;
+    busy = true; const started = generation;
     try {
-      result = await fetchCockpitTasks(host);
-      if (disposed) return;
+      const next = await fetchCockpitTasks(host);
+      if (disposed || started !== generation || !enabled || !prefs.cockpitEmail) return;
+      result = next;
       onTasks(result.status === 'ok' ? result.tasks : []); render();
-    } finally { busy = false; if (!disposed && frameVisible && !document.hidden) timer = setTimeout(() => { void poll(); }, 60_000); }
+    } finally { busy = false; if (started !== generation) { void poll(); } else if (!disposed && enabled && prefs.cockpitEmail && frameVisible && !document.hidden) timer = setTimeout(() => { void poll(); }, 60_000); }
   };
   const visibility = () => { if (timer) clearTimeout(timer); timer = null; if (frameVisible && !document.hidden) void poll(); };
   const hide = () => { frameVisible = false; visibility(); }; const show = () => { frameVisible = true; visibility(); };
   window.addEventListener('pagehide', hide); window.addEventListener('pageshow', show); document.addEventListener('visibilitychange', visibility);
+  const setPrefs = (value: CockpitPrefs, allowed = enabled) => {
+    const changed = !ready || prefs.cockpitEmail !== value.cockpitEmail || allowed !== enabled;
+    prefs = value; enabled = allowed; ready = true;
+    if (changed) { generation++; result = null; if (timer) clearTimeout(timer); timer = null; onTasks([]); }
+    updateControls(); if (changed) void poll();
+  };
   render();
   return {
-    setPrefs: (value: CockpitPrefs) => { prefs = value; updateControls(); if (!ready) { ready = true; void poll(); } },
+    setPrefs,
+    setEnabled: (value: boolean) => {
+      if (enabled === value) return;
+      enabled = value; generation++;
+      if (timer) clearTimeout(timer); timer = null;
+      if (!enabled) { result = null; onTasks([]); render(); } else void poll();
+    },
     dispose: () => { disposed = true; if (timer) clearTimeout(timer); window.removeEventListener('pagehide', hide); window.removeEventListener('pageshow', show); document.removeEventListener('visibilitychange', visibility); section.remove(); },
   };
 };

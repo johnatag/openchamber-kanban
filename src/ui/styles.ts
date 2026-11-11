@@ -1,5 +1,14 @@
 const CSS = `
 *{box-sizing:border-box}
+[hidden]{display:none!important}
+.kb-tabs{display:flex;gap:4px;border-bottom:1px solid var(--oc-border)}
+.kb-tab{font:inherit;color:var(--oc-muted);background:transparent;border:0;border-bottom:2px solid transparent;padding:8px 12px;cursor:pointer}
+.kb-tab[aria-selected=true]{color:var(--oc-fg);border-bottom-color:var(--oc-primary);font-weight:600}
+.kb-tab:focus-visible{outline:2px solid var(--oc-focus);outline-offset:-2px}
+.kb-tabpanel{min-width:0}
+.kb-tabpanel[role=tabpanel]:focus-visible{outline:2px solid var(--oc-focus)}
+.kb-tabpanel>.kb-row{margin-bottom:14px}
+.kb-toolbar>select{font:inherit;color:var(--oc-fg);background:var(--oc-elevated);border:1px solid var(--oc-border);border-radius:6px;padding:6px}
 html,body{margin:0;min-height:100%;background:var(--oc-bg);color:var(--oc-fg);font-family:var(--oc-font);font-size:14px;line-height:1.45}
 #root{min-height:100%}
 .kb-page{display:flex;flex-direction:column;gap:14px;padding:16px;min-height:100%}

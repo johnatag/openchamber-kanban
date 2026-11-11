@@ -15,6 +15,8 @@ import { DEFAULT_SYNC_OPTIONS } from '../domain/sync.ts';
 import { sessionLinkState, worktreeLinkState, type SessionGoneReason, type SessionsView, type WorktreesView } from '../domain/unlink.ts';
 import { selectSessionsToImport, sessionTitleForTask, titleForOrphanSession } from '../domain/autoTask.ts';
 import { buildBaseBranchOptions, describeWorktreeOption, hasKnownBranches, resolveTaskWorktree } from '../domain/worktree.ts';
+import { mountBoardTabs } from './tabs.ts';
+import { hasCockpitScope, isWorkProject } from '../domain/projectScope.ts';
 import { mountCockpitFeed } from './cockpit.ts';
 import { linkedCockpitTasks, type CockpitTask } from '../domain/cockpit.ts';
 import { mountHarnessFeed } from './harness.ts';
@@ -48,13 +50,24 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
   const page = el('div', 'kb-page');
   root.append(page);
 
+  const tabs = mountBoardTabs(page, (activeTab) => {
+    prefs = { ...prefs, activeTab };
+    void savePrefs(host, prefs).catch(notify);
+  });
+  const boardPanel = tabs.panels.board;
   const toolbar = el('div', 'kb-toolbar'); page.append(toolbar);
   const projectSelectWrap = el('div'); toolbar.append(projectSelectWrap);
+  const projectTag = el('select'); projectTag.setAttribute('aria-label', 'Project type');
+  for (const [value, label] of [['personal', 'Personal'], ['work', 'Work']]) {
+    const option = el('option', '', label); option.value = value!; projectTag.append(option);
+  }
+  toolbar.append(projectTag);
   const searchWrap = el('div', 'grow'); toolbar.append(searchWrap);
   // Remains clickable while work is pending: reload coalesces follow-up requests.
   mountButton(toolbar, { label: 'Refresh', variant: 'ghost', onClick: () => { void reload(); } });
 
-  const addRow = el('div', 'kb-row'); page.append(addRow);
+  page.append(tabs.panels.board, tabs.panels.harness, tabs.panels.cockpit);
+  const addRow = el('div', 'kb-row'); boardPanel.append(addRow);
   const bannerSlot = el('div'); page.append(bannerSlot);
   bannerSlot.hidden = true;
   const banner = mountBanner(bannerSlot, { tone: 'error', title: '' });
@@ -125,14 +138,15 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     },
   });
 
-  const columnsRoot = el('div', 'kb-columns'); page.append(columnsRoot);
+  const columnsRoot = el('div', 'kb-columns'); boardPanel.append(columnsRoot);
   const spinnerSlot = el('div'); page.append(spinnerSlot);
-  const harness = mountHarnessFeed(host, page);
+  const harness = mountHarnessFeed(host, tabs.panels.harness, available => tabs.setAvailable('harness', available));
 
   let tasks: Task[] = [];
   let projects: GuestProject[] = [];
   let prefs: Prefs = { ...DEFAULT_PREFS };
   let cockpitTasks: CockpitTask[] = [];
+  let cockpitHasContent = true;
   let filter: BoardFilter = { projectId: ALL_PROJECTS, query: '' };
   let detail: { dispose: () => void } | null = null;
   let draggingId: string | null = null;
@@ -327,6 +341,16 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     return adoption;
   };
   let orphanWatcher: { dispose: () => void } | null = null;
+
+  projectTag.addEventListener('change', () => {
+    const project = projects.find(project => project.id === filter.projectId);
+    if (!project) return;
+    const next: Prefs = { ...prefs, projectTags: { ...prefs.projectTags, [project.id]: projectTag.value === 'work' ? 'work' : 'personal' } };
+    void savePrefs(host, next).then(() => {
+      if (disposed) return;
+      prefs = { ...prefs, projectTags: next.projectTags }; render();
+    }, error => { projectTag.value = prefs.projectTags[project.id] ?? 'personal'; notify(error); });
+  });
 
   const projectOptions = () => [
     { id: ALL_PROJECTS, label: 'All projects' },
@@ -611,6 +635,14 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
   };
 
   const render = () => {
+    const scope = { projects, projectId: filter.projectId, projectTags: prefs.projectTags };
+    projectTag.hidden = !projects.some(project => project.id === filter.projectId);
+    projectTag.value = prefs.projectTags[filter.projectId] ?? 'personal';
+    harness.setScope(scope);
+    const cockpitAvailable = hasCockpitScope(scope);
+    tabs.setAvailable('cockpit', cockpitAvailable && cockpitHasContent);
+    tabs.setSelected(prefs.activeTab);
+    cockpit.setEnabled(cockpitAvailable);
     columnsRoot.replaceChildren();
     const columns = groupColumns(tasks, filter);
     updateBadge();
@@ -641,7 +673,7 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     const project = task.projectId ? projects.find((p) => p.id === task.projectId)?.name ?? task.projectId : null;
     if (project) meta.append(el('span', 'kb-muted', project));
     if (task.sessionId) meta.append(el('span', 'kb-mono', `session:${task.sessionId.slice(0, 8)}`));
-    for (const linked of linkedCockpitTasks(cockpitTasks, task.title, task.worktree?.branch, task.sourceBranch)) meta.append(el('span', 'kb-mono', linked.key + ' · ' + linked.status));
+    for (const linked of linkedCockpitTasks(isWorkProject({ projects, projectId: filter.projectId, projectTags: prefs.projectTags }, task.projectId) ? cockpitTasks : [], task.title, task.worktree?.branch, task.sourceBranch)) meta.append(el('span', 'kb-mono', linked.key + ' · ' + linked.status));
     card.append(meta);
     if (!task.sessionId) card.append(el('p', 'kb-muted', 'No session yet — click to start an agent or link one.'));
     card.addEventListener('click', (event) => {
@@ -766,12 +798,12 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
       }
       setTasks(loaded);
       prefs = loadedPrefs;
-      cockpit.setPrefs(prefs);
       filter = { projectId: prefs.projectId, query: prefs.query };
       projectSelect.update({ value: filter.projectId, options: projectOptions() });
       searchField.update({ value: filter.query });
       if (failedKeys.length) showBanner('Some tasks could not be loaded', `${failedKeys.length} record(s) were skipped. Other tasks are safe; Refresh retries.`, 'warning');
       else clearBanner();
+      cockpit.setPrefs(prefs, hasCockpitScope({ projects, projectId: filter.projectId, projectTags: prefs.projectTags }));
       render();
       // Stale links (a session or worktree deleted while this board was closed)
       // are cleared before the orphan watcher starts, so a session whose link
@@ -787,11 +819,14 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     }
   };
 
-  const cockpit = mountCockpitFeed(host, page, async (patch) => {
+  const cockpit = mountCockpitFeed(host, tabs.panels.cockpit, async (patch) => {
     const next = { ...prefs, ...patch };
     await savePrefs(host, next);
     prefs = next;
-  }, (next) => { cockpitTasks = next; harness.setCockpitTasks(next); render(); });
+  }, (next) => { cockpitTasks = next; harness.setCockpitTasks(next); render(); }, available => {
+    cockpitHasContent = available;
+    tabs.setAvailable('cockpit', available && hasCockpitScope({ projects, projectId: filter.projectId, projectTags: prefs.projectTags }));
+  });
 
   let stopProjects: (() => void) | null = null;
   void watchProjects(host, (state) => {

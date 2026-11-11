@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import type { HostClient, JsonValue } from '@openchamber/sdk';
 import { createTask } from '../src/domain/task.ts';
 import { deleteTask, loadTasks, saveTask, taskKey } from '../src/store/taskStore.ts';
-import { DEFAULT_PREFS, loadPrefs, savePrefs } from '../src/store/prefs.ts';
+import { DEFAULT_PREFS, loadPrefs, savePrefs, parsePrefs } from '../src/store/prefs.ts';
 import { DISMISSED_SESSIONS_KEY, loadDismissedSessions, saveDismissedSessions } from '../src/store/dismissedSessions.ts';
 
 /** In-memory stand-in for host.storage that serializes like the host (JSON, 64 KiB per value). */
@@ -92,4 +92,15 @@ test('dismissed session ids persist across reload and ignore malformed stored va
 
   data.set(DISMISSED_SESSIONS_KEY, JSON.stringify(['ses_kept', '', 42, null]));
   assert.deepEqual([...await loadDismissedSessions(host)], ['ses_kept']);
+});
+
+
+test('tab and project tags persist, while malformed preferences default to Board and Personal', async () => {
+  const { host } = fakeHost();
+  const prefs = { ...DEFAULT_PREFS, activeTab: 'cockpit' as const, projectTags: { p: 'work' as const, home: 'personal' as const } };
+  await savePrefs(host, prefs);
+  assert.deepEqual(await loadPrefs(host), prefs);
+  const parsed = parsePrefs({ activeTab: 'unknown', projectTags: { p: 'work', home: 'personal', bad: 'WORK', other: null } });
+  assert.equal(parsed.activeTab, 'board');
+  assert.deepEqual(parsed.projectTags, { p: 'work', home: 'personal' });
 });
