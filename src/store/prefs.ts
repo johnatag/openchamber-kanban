@@ -42,26 +42,40 @@ export const parsePrefs = (value: unknown): Prefs => {
 };
 
 export const tagKey = (id: string) => `tag:${id}`;
-const parseTag = (value: unknown): ProjectTag | undefined => value === 'work' || value === 'personal' ? value : undefined;
+export const TAG_MIGRATION_KEY = 'tagMigration';
+type TagRecord = { value: ProjectTag | undefined; at: number };
+const parseTagRecord = (raw: unknown): TagRecord => {
+  const record = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : { value: raw };
+  return {
+    value: record.value === 'work' || record.value === 'personal' ? record.value : undefined,
+    at: typeof record.at === 'number' && Number.isFinite(record.at) && record.at >= 0 ? record.at : 0,
+  };
+};
 
-/** Only explicit tag patches (and legacy migration) write tag keys. */
-export const saveProjectTag = async (host: Storage, id: string, tag: ProjectTag | null) => {
+/** Compare the user's click time with storage, including when a queue was blocked. */
+export const saveProjectTag = async (host: Storage, id: string, tag: ProjectTag | null, at: number) => {
+  const stored = parseTagRecord(await host.storage.get(tagKey(id)));
+  if (stored.at > at || (stored.at === at && tag !== 'personal')) return { tag: stored.value, conflict: true };
   if (tag === null) await host.storage.delete(tagKey(id));
-  else await host.storage.set(tagKey(id), tag);
+  else await host.storage.set(tagKey(id), { value: tag, at });
+  return { tag: tag ?? undefined, conflict: false };
 };
 
 export const loadProjectTags = async (host: Storage, ids?: readonly string[]): Promise<Record<string, ProjectTag>> => {
   const projectIds = ids ?? (await host.storage.keys()).filter(key => key.startsWith('tag:')).map(key => key.slice(4));
-  const entries = await Promise.all(projectIds.map(async id => [id, parseTag(await host.storage.get(tagKey(id)))] as const));
+  const entries = await Promise.all(projectIds.map(async id => [id, parseTagRecord(await host.storage.get(tagKey(id))).value] as const));
   return Object.fromEntries(entries.filter((entry): entry is readonly [string, ProjectTag] => entry[1] !== undefined));
 };
 
 export const loadPrefs = async (host: Storage): Promise<Prefs> => {
   const raw = await host.storage.get(PREFS_KEY);
   const prefs = parsePrefs(raw);
-  // Existing keys, including malformed values, win over the legacy snapshot.
-  for (const [id, tag] of Object.entries(prefs.projectTags)) {
-    if (await host.storage.get(tagKey(id)) == null) await saveProjectTag(host, id, tag);
+  if (await host.storage.get(TAG_MIGRATION_KEY) !== true) {
+    // Existing keys, including malformed values, win over the legacy snapshot.
+    for (const [id, tag] of Object.entries(prefs.projectTags)) {
+      if (await host.storage.get(tagKey(id)) == null) await host.storage.set(tagKey(id), { value: tag, at: 0 });
+    }
+    await host.storage.set(TAG_MIGRATION_KEY, true);
   }
   if (raw && typeof raw === 'object' && Object.hasOwn(raw, 'projectTags')) {
     // Read again so migration does not replay the other surface's old settings.

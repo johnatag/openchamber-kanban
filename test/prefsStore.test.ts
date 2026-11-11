@@ -1,3 +1,4 @@
+import { loadProjectTags } from '../src/store/prefs.ts';
 import type { JsonValue } from '@openchamber/sdk';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -6,7 +7,7 @@ import { loadPrefs, parsePrefs } from '../src/store/prefs.ts';
 const settle = async () => { for (let i = 0; i < 100; i++) await Promise.resolve(); };
 const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; };
 const fixture = () => {
-  const stored = new Map<string, JsonValue>([['prefs', { cockpitEmail: 'saved@example.com', query: 'saved' }], ['tag:p', 'work'], ['tag:q', 'work']]);
+  const stored = new Map<string, JsonValue>([['tagMigration', true], ['prefs', { cockpitEmail: 'saved@example.com', query: 'saved' }], ['tag:p', 'work'], ['tag:q', 'work']]);
   const loading = deferred();
   const writes: { key: string; value: JsonValue; gate: ReturnType<typeof deferred>; fail: boolean }[] = [];
   const host = { storage: {
@@ -27,9 +28,9 @@ test('patches wait for load; failed Personal stays in memory and is retried by t
   f.loading.resolve(); await settle();
   assert.equal(store.view().cockpitEmail, 'saved@example.com');
   assert.equal(f.writes[0]!.key, 'tag:p'); f.writes[0]!.fail = true; f.writes[0]!.gate.resolve(); await personal;
-  assert.equal(store.view().projectTags.p, 'personal'); assert.equal(f.stored.get('tag:p'), 'work');
+  assert.equal(store.view().projectTags.p, 'personal'); assert.equal((await loadProjectTags(f.host))['p'], 'work');
   const query = store.patch({ query: 'new' }); await f.flush(); await query;
-  assert.equal(f.stored.get('tag:p'), 'personal');
+  assert.equal((await loadProjectTags(f.host))['p'], 'personal');
   assert.equal((f.stored.get('prefs') as any).projectTags, undefined);
   assert.deepEqual(await loadPrefs(f.host), store.view());
 });
@@ -44,7 +45,8 @@ test('two stores re-read confirmed fields and only write their own patches', asy
   assert.equal(prefs.cockpitEmail, 'new@example.com'); assert.equal(prefs.query, 'other surface'); assert.equal(prefs.projectTags.p, 'personal');
 });
 
-test('seeded interleavings across two stores never replay stale Work tags or unrelated fields', async () => {
+test('seeded interleavings across two stores never replay stale Work tags or unrelated fields', async (t) => {
+  let now = 1000; t.mock.method(Date, 'now', () => ++now);
   let seed = 0x61b3;
   const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 2 ** 32; };
   for (let run = 0; run < 40; run++) {
@@ -63,8 +65,8 @@ test('seeded interleavings across two stores never replay stale Work tags or unr
         if (random() < 0.5) for (const write of f.writes) if (random() < 0.5) write.gate.resolve();
         await settle();
       }
-      if (personal) assert.equal(f.stored.get('tag:p'), 'personal', `seed run ${run}, step ${step}`);
-      assert.equal(f.stored.get('tag:q'), 'work');
+      if (personal) assert.equal((await loadProjectTags(f.host))['p'], 'personal', `seed run ${run}, step ${step}`);
+      assert.equal((await loadProjectTags(f.host))['q'], 'work');
     }
     await f.flush(); await Promise.all(promises);
     if (personal) assert.equal((await loadPrefs(f.host)).projectTags.p, 'personal');
@@ -78,7 +80,7 @@ test('a failed load never writes defaults and a later writer retries loading saf
   await assert.rejects(store.patch({ projectTags: { p: 'personal' } }), /load unavailable/);
   assert.equal(f.writes.length, 0); assert.equal(store.view().projectTags.p, 'personal');
   const writing = store.patch({ query: 'retry' }); f.loading.resolve(); await f.flush(); await writing;
-  assert.equal((await loadPrefs(f.host)).cockpitEmail, 'saved@example.com'); assert.equal(f.stored.get('tag:p'), 'personal');
+  assert.equal((await loadPrefs(f.host)).cockpitEmail, 'saved@example.com'); assert.equal((await loadProjectTags(f.host))['p'], 'personal');
 });
 
 test('legacy tags migrate once, existing per-project values win, and prefs never store tags', async () => {
@@ -87,6 +89,35 @@ test('legacy tags migrate once, existing per-project values win, and prefs never
   const first = await loadPrefs(host);
   assert.deepEqual(first.projectTags, { p: 'personal', q: 'work' }); assert.equal(first.query, 'keep');
   assert.equal(Object.hasOwn(data.get('prefs') as object, 'projectTags'), false);
-  data.delete('tag:q'); await loadPrefs(host); assert.equal(data.has('tag:q'), false, 'migration cannot resurrect removed tags');
-  assert.equal(parsePrefs(data.get('prefs')).query, 'keep');
+  data.delete('tag:q');
+  data.set('prefs', { query: 'updated', projectTags: { q: 'work', resurrected: 'work' } });
+  await loadPrefs(host); assert.equal(data.has('tag:q'), false, 'migration cannot resurrect removed tags');
+  assert.equal(data.has('tag:resurrected'), false);
+  assert.equal(data.get('tagMigration'), true);
+  assert.equal(parsePrefs(data.get('prefs')).query, 'updated');
+});
+
+test('tag click ordering rejects stale Personal, favours Personal on ties, and treats old records as time zero', async (t) => {
+  const f = fixture(); f.loading.resolve();
+  let now = 20; t.mock.method(Date, 'now', () => now);
+  let conflicts = 0;
+  const store = createPrefsStore(f.host, () => {}, () => { conflicts++; }); await store.load();
+  f.stored.set('tag:p', { value: 'work', at: 21 });
+  const stale = store.patch({ projectTags: { p: 'personal' } });
+  assert.equal(store.view().projectTags.p, 'personal', 'Personal is immediate');
+  await f.flush(); await stale;
+  assert.equal(store.view().projectTags.p, 'work', 'adopts only the newer stored Work'); assert.equal(conflicts, 1);
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'work', at: 21 });
+  now = 21;
+  const tiePersonal = store.patch({ projectTags: { p: 'personal' } }); await f.flush(); await tiePersonal;
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'personal', at: 21 });
+  const tieWork = store.patch({ projectTags: { p: 'work' } }); await f.flush(); await tieWork;
+  assert.equal(store.view().projectTags.p, 'personal'); assert.equal(conflicts, 2);
+  now = 22;
+  const newerWork = store.patch({ projectTags: { p: 'work' } }); await f.flush(); await newerWork;
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'work', at: 22 });
+  f.stored.set('tag:p', { value: 'personal' });
+  now = 1;
+  const legacy = store.patch({ projectTags: { p: 'work' } }); await f.flush(); await legacy;
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'work', at: 1 });
 });

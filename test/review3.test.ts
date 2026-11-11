@@ -1,3 +1,4 @@
+import { loadProjectTags } from '../src/store/prefs.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { BoardHost } from '../src/ui/board.ts';
@@ -104,37 +105,56 @@ test('R3 remount while a Personal write is still in flight', async (t) => {
 
 
 
-test('seeded panel/page interleavings preserve Personal and stop all subsequent polls until explicit Work', async (t) => {
+test('seeded panel/page interleavings with a slow writer preserve the latest click and gate every poll', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
+  let now = 1000; t.mock.method(Date, 'now', () => ++now);
   let seed = 0xb407;
   const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 2 ** 32; };
   for (let run = 0; run < 20; run++) {
     const fake = fakeHost(); const polls = { n: 0 }; fake.host.serviceRequest = ok(polls) as any;
     fake.stored.set('prefs', { projectId: 'p', cockpitEmail: 'me@example.com' }); fake.stored.set('tag:p', 'work');
+    const windows = [0, 1].map(() => {
+      let gate: Promise<void> | null = null;
+      return {
+        host: { ...fake.host, storage: { ...fake.host.storage, set: async (key: string, value: any) => { if (gate) await gate; await fake.host.storage.set(key, value); } } },
+        hang: () => { const d = deferred<void>(); gate = d.promise; return () => { gate = null; d.resolve(); }; },
+      };
+    });
     const doms = [setup(), setup()];
-    const boards = doms.map(dom => mountKanbanBoard(fake.host, dom.element)); await settle();
-    const q = gatedPrefs(fake); let personal = false;
+    const boards = doms.map((dom, i) => mountKanbanBoard(windows[i]!.host, dom.element)); await settle();
+    let latest: 'personal' | 'work' = 'work'; let latestAt = 0;
+    const choose = async (index: number, value: 'work' | 'personal') => {
+      const tag = tagSel(doms[index]!.root); tag.value = value; const clickedAt = now + 1;
+      tag.dispatchEvent(new Event('change')); await settle(); return clickedAt;
+    };
+    const verify = async (step: number) => {
+      assert.equal((await loadProjectTags(fake.host)).p, latest, `seed run ${run}, step ${step}`);
+      if (latestAt) assert.deepEqual(fake.stored.get('tag:p'), { value: latest, at: latestAt });
+      const before = polls.n;
+      t.mock.timers.tick(60_000); doms.forEach(dom => dom.win.dispatchEvent(new Event('pageshow'))); await settle();
+      if (latest === 'personal') assert.equal(polls.n, before, `no polls: run ${run}, step ${step}`);
+    };
     try {
       for (let step = 0; step < 25; step++) {
         const index = random() < 0.5 ? 0 : 1;
         if (step % 6 === 0) {
-          // A tab write from the other instance is already in flight when the tag changes.
-          click(doms[1 - index]!.root, 'Board'); await settle();
-          const tag = tagSel(doms[index]!.root); personal = random() < 0.8;
-          tag.value = personal ? 'personal' : 'work'; tag.dispatchEvent(new Event('change')); await settle();
-          await flush(q); await settle();
-          assert.equal(fake.stored.get('tag:p'), personal ? 'personal' : 'work');
+          // Block the queue before its tag read, across completed writes in the other window.
+          const release = windows[index]!.hang();
+          try {
+            click(doms[index]!.root, 'Board'); await settle();
+            await choose(index, random() < 0.5 ? 'personal' : 'work');
+            for (const value of ['work', random() < 0.8 ? 'personal' : 'work'] as const) {
+              latestAt = await choose(1 - index, value); latest = value;
+              await verify(step);
+            }
+          } finally { release(); }
+          await settle(); await settle(); await verify(step);
+          assert.equal(tagSel(doms[index]!.root).value, latest, 'slow writer adopts the winner');
         } else {
-          const before = polls.n;
-          if (random() < 0.5) click(doms[index]!.root, 'Board');
-          else { t.mock.timers.tick(60_000); doms[index]!.win.dispatchEvent(new Event('pageshow')); }
-          await settle();
-          if (random() < 0.5) await flush(q);
-          if (personal) { assert.equal(polls.n, before, `seed run ${run}, step ${step}`); assert.equal(fake.stored.get('tag:p'), 'personal'); }
+          click(doms[index]!.root, 'Board'); await settle(); await verify(step);
         }
       }
-      await flush(q);
-    } finally { q.restore(); boards.forEach(board => board.dispose()); }
+    } finally { boards.forEach(board => board.dispose()); }
   }
 });
 
@@ -151,7 +171,28 @@ test('storage preflight fails closed and an in-memory failed Personal save overr
     fake.host.storage.get = get;
     fake.host.storage.set = async () => { throw new Error('save failed'); };
     const tag = tagSel(dom.root); tag.value = 'personal'; tag.dispatchEvent(new Event('change')); await settle();
-    assert.equal(fake.stored.get('tag:p'), 'work'); assert.equal(tag.value, 'personal');
+    assert.equal((await loadProjectTags(fake.host))['p'], 'work'); assert.equal(tag.value, 'personal');
     dom.win.dispatchEvent(new Event('pageshow')); t.mock.timers.tick(120_000); await settle(); assert.equal(polls.n, before);
+  } finally { board.dispose(); }
+});
+
+
+test('failed and refused storage checks retry after 60 seconds and remain gated', async (t) => {
+  const fake = fakeHost(); const dom = setup(); t.mock.timers.enable({ apis: ['setTimeout'] }); const polls = { n: 0 };
+  fake.stored.set('prefs', { projectId: 'p', cockpitEmail: 'me@example.com' }); fake.stored.set('tag:p', 'work');
+  fake.host.serviceRequest = ok(polls) as any;
+  const board = mountKanbanBoard(fake.host, dom.element); await settle();
+  try {
+    const before = polls.n; const get = fake.host.storage.get;
+    fake.host.storage.get = async key => { if (key.startsWith('tag:')) throw new Error('offline'); return get(key); };
+    t.mock.timers.tick(60_000); await settle(); assert.equal(polls.n, before);
+    fake.host.storage.get = get;
+    t.mock.timers.tick(59_999); await settle(); assert.equal(polls.n, before);
+    t.mock.timers.tick(1); await settle(); assert.equal(polls.n, before + 1, 'transient error recovers on timer');
+    fake.stored.set('tag:p', { value: 'personal', at: 100 });
+    t.mock.timers.tick(60_000); await settle(); assert.equal(polls.n, before + 1);
+    t.mock.timers.tick(60_000); await settle(); assert.equal(polls.n, before + 1, 'denied checks never poll');
+    fake.stored.set('tag:p', { value: 'work', at: 101 });
+    t.mock.timers.tick(60_000); await settle(); assert.equal(polls.n, before + 2, 'refused check recovers on timer');
   } finally { board.dispose(); }
 });

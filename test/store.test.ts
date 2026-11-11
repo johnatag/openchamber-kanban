@@ -99,7 +99,7 @@ test('tab and project tags persist, while malformed preferences default to Board
   const { host } = fakeHost();
   const prefs = { ...DEFAULT_PREFS, activeTab: 'cockpit' as const, projectTags: { p: 'work' as const, home: 'personal' as const } };
   await savePrefs(host, prefs);
-  for (const [id, tag] of Object.entries(prefs.projectTags)) await saveProjectTag(host, id, tag);
+  for (const [id, tag] of Object.entries(prefs.projectTags)) await saveProjectTag(host, id, tag, Date.now());
   assert.deepEqual(await loadPrefs(host), prefs);
   const parsed = parsePrefs({ activeTab: 'unknown', projectTags: { p: 'work', home: 'personal', bad: 'WORK', other: null } });
   assert.equal(parsed.activeTab, 'board');

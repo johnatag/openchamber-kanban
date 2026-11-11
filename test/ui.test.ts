@@ -1,3 +1,4 @@
+import { loadProjectTags } from '../src/store/prefs.ts';
 import { filterCockpitTasks } from '../src/domain/cockpit.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -263,7 +264,7 @@ test('Personal and untagged projects never call Cockpit, Work requires email, an
     const tag = dom.root.querySelectorAll('select').find(n => n.getAttribute('aria-label') === 'Project type')!;
     assert.ok(tag); assert.equal(tag.value, 'personal');
     tag.value = 'work'; tag.dispatchEvent(new Event('change')); await settle();
-    assert.equal(fake.stored.get('tag:p'), 'work'); assert.equal(polls, 1);
+    assert.equal((await loadProjectTags(fake.host))['p'], 'work'); assert.equal(polls, 1);
     click(dom.root, 'Cockpit'); assert.match(dom.root.querySelector('.kb-cockpit')!.textContent, /3 cancelled hidden/);
     tag.value = 'personal'; tag.dispatchEvent(new Event('change')); await settle();
     assert.equal(selectedTab(dom.root)?.textContent, 'Board');
@@ -391,7 +392,7 @@ test('REVIEW race: tag Work->Personal then quick tab click; queued tab save pres
   gate.resolve(); await settle();
   for (const [k, v] of queue) fake.stored.set(k, v);
   fake.host.storage.set = origSet;
-  assert.equal(fake.stored.get('tag:p'), 'personal');
+  assert.equal((await loadProjectTags(fake.host))['p'], 'personal');
   board.dispose();
   const before = polls;
   board = mountKanbanBoard(fake.host, dom.element); await settle();
@@ -423,7 +424,7 @@ test('REVIEW race: Cockpit email save in flight preserves a Work->Personal tag c
   assert.equal(tag.value, 'personal');
   assert.equal(tabs(dom.root).find(n => n.textContent === 'Cockpit')!.hidden, true);
   assert.equal(polls - p1, 0);
-  assert.equal(fake.stored.get('tag:p'), 'personal');
+  assert.equal((await loadProjectTags(fake.host))['p'], 'personal');
   assert.equal((fake.stored.get('prefs') as any).cockpitEmail, 'other@example.com');
   board.dispose();
 });
@@ -453,20 +454,20 @@ test('deleted tags require non-empty ready lists at least ten minutes apart', as
   fake.stored.set('prefs', { projectTags: { p: 'work', gone: 'work' } });
   const board = mountKanbanBoard(fake.host, dom.element);
   try {
-    await settle(); assert.deepEqual([fake.stored.get('tag:p'), fake.stored.get('tag:gone')], ['work', 'work']);
+    await settle(); assert.deepEqual([(await loadProjectTags(fake.host))['p'], (await loadProjectTags(fake.host))['gone']], ['work', 'work']);
     emit({ state: 'ready', projects: [{ id: 'p', name: 'Renamed', directory: '/project' }] }); await settle();
-    assert.deepEqual([fake.stored.get('tag:p'), fake.stored.get('tag:gone')], ['work', 'work']);
+    assert.deepEqual([(await loadProjectTags(fake.host))['p'], (await loadProjectTags(fake.host))['gone']], ['work', 'work']);
     emit({ state: 'ready', projects: [] }); await settle();
     emit({ state: 'ready', projects: [{ id: 'p', name: 'P', directory: '/project' }] }); await settle();
-    assert.deepEqual([fake.stored.get('tag:p'), fake.stored.get('tag:gone')], ['work', 'work']);
+    assert.deepEqual([(await loadProjectTags(fake.host))['p'], (await loadProjectTags(fake.host))['gone']], ['work', 'work']);
     emit({ state: 'ready', projects: [{ id: 'p', name: 'P', directory: '/project' }] }); await settle();
-    assert.equal(fake.stored.get('tag:gone'), 'work', 'quick repeated snapshots cannot prune');
+    assert.equal((await loadProjectTags(fake.host))['gone'], 'work', 'quick repeated snapshots cannot prune');
     t.mock.timers.tick(599_999);
     emit({ state: 'ready', projects: [{ id: 'p', name: 'P', directory: '/project' }] }); await settle();
-    assert.equal(fake.stored.get('tag:gone'), 'work');
+    assert.equal((await loadProjectTags(fake.host))['gone'], 'work');
     t.mock.timers.tick(1);
     emit({ state: 'ready', projects: [{ id: 'p', name: 'P', directory: '/project' }] }); await settle();
-    assert.equal(fake.stored.has('tag:gone'), false); assert.equal(fake.stored.get('tag:p'), 'work');
+    assert.equal(fake.stored.has('tag:gone'), false); assert.equal((await loadProjectTags(fake.host))['p'], 'work');
   } finally { board.dispose(); }
 });
 
@@ -501,7 +502,7 @@ test('a refresh started before Personal cannot restore stale loaded preferences'
     const before = polls; gate.resolve(); await settle();
     t.mock.timers.tick(120000); dom.win.dispatchEvent(new Event('pageshow')); await settle();
     assert.equal(tag.value, 'personal'); assert.equal(polls, before);
-    assert.equal(fake.stored.get('tag:p'), 'personal');
+    assert.equal((await loadProjectTags(fake.host))['p'], 'personal');
   } finally { board.dispose(); }
 });
 
@@ -519,7 +520,7 @@ test('a failed email write rolls back only its fields and the queue still saves 
     tag.value = 'personal'; tag.dispatchEvent(new Event('change'));
     gate.resolve(); await settle();
     const prefs = fake.stored.get('prefs') as any;
-    assert.equal(fake.stored.get('tag:p'), 'personal'); assert.equal(prefs.cockpitEmail, 'me@example.com');
+    assert.equal((await loadProjectTags(fake.host))['p'], 'personal'); assert.equal(prefs.cockpitEmail, 'me@example.com');
     assert.equal(tag.value, 'personal'); assert.equal(tabs(dom.root).find(n => n.textContent === 'Cockpit')!.hidden, true);
     assert.match(dom.root.textContent, /Storage unavailable/);
   } finally { board.dispose(); }

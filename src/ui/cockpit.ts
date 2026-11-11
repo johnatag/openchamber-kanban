@@ -73,7 +73,7 @@ export const mountCockpitFeed = (host: Pick<HostClient, 'serviceRequest' | 'toas
       if (disposed || started !== generation || !enabled || !prefs.cockpitEmail) return;
       result = next;
       onTasks(result.status === 'ok' ? result.tasks : []); render();
-    } finally { busy = false; if (started !== generation) { void poll(); } else if (storageAllowed && !disposed && enabled && prefs.cockpitEmail && frameVisible && !document.hidden) timer = setTimeout(() => { void poll(); }, 60_000); }
+    } finally { busy = false; if (started !== generation) { void poll(); } else if (!disposed && enabled && prefs.cockpitEmail && frameVisible && !document.hidden) timer = setTimeout(() => { void poll(); }, 60_000); }
   };
   const visibility = () => { if (timer) clearTimeout(timer); timer = null; if (frameVisible && !document.hidden) void poll(); };
   const hide = () => { frameVisible = false; visibility(); }; const show = () => { frameVisible = true; visibility(); };
