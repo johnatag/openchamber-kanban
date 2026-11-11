@@ -2,7 +2,7 @@ import { open } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { slimCockpitTasks, type CockpitResponse } from '../domain/cockpit.ts';
+import { slimCancelledTasks, slimCockpitTasks, type CockpitResponse } from '../domain/cockpit.ts';
 
 const ENDPOINT = 'https://cockpit.internal.angelsoftwares.ca/api/mcp/server';
 const VERSION = '2025-03-26';
@@ -109,8 +109,9 @@ export const createCockpitReader = (options: { fetch?: typeof fetch; now?: () =>
       // Even a remote server reflecting credentials in a projected field must not expose them.
       if (JSON.stringify(tasks).includes(JSON.stringify(key).slice(1, -1))) return fail('Cockpit returned unsafe task data');
       const records = record(payload) ? payload.tasks : payload;
-      const cancelledHidden = (records as Record<string, unknown>[]).filter(task => task.cancelledAt != null).length;
-      cached = { status: 'ok', tasks, cancelledHidden }; expires = now() + 60_000;
+      const cancelledTasks = slimCancelledTasks((records as Record<string, unknown>[]).filter(task => task.cancelledAt != null));
+      if (JSON.stringify(cancelledTasks).includes(JSON.stringify(key).slice(1, -1))) return fail('Cockpit returned unsafe task data');
+      cached = { status: 'ok', tasks, cancelledTasks }; expires = now() + 60_000;
       return cached;
     } catch (error) {
       cached = null;
@@ -118,11 +119,11 @@ export const createCockpitReader = (options: { fetch?: typeof fetch; now?: () =>
     } finally {
       clearTimeout(timer);
       if (session && key) {
-        try {
-          const response = await request(ENDPOINT, { method: 'DELETE', redirect: 'error', signal: AbortSignal.timeout(options.timeoutMs ?? 15_000),
+        void (async () => {
+          const response = await request(ENDPOINT, { method: 'DELETE', redirect: 'error', signal: AbortSignal.timeout(2_000),
             headers: { Authorization: `Bearer ${key}`, 'Mcp-Session-Id': session, 'MCP-Protocol-Version': VERSION } });
           await response.body?.cancel();
-        } catch { /* Session termination is best-effort, including servers that do not support DELETE. */ }
+        })().catch(() => { /* Session termination is best-effort. */ });
       }
     }
   };

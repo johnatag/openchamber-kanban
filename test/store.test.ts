@@ -103,4 +103,6 @@ test('tab and project tags persist, while malformed preferences default to Board
   const parsed = parsePrefs({ activeTab: 'unknown', projectTags: { p: 'work', home: 'personal', bad: 'WORK', other: null } });
   assert.equal(parsed.activeTab, 'board');
   assert.deepEqual(parsed.projectTags, { p: 'work', home: 'personal' });
+  for (const projectTags of [null, ['work'], 'work']) assert.deepEqual(parsePrefs({ projectTags }).projectTags, {});
+  assert.equal(parsePrefs(JSON.parse('{"projectTags":{"__proto__":"work"}}')).projectTags.__proto__, 'work');
 });

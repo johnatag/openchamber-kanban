@@ -70,7 +70,7 @@ test('MCP handshake, slimming, cancellation, single-flight, exact cache boundary
   try {
     const read = createCockpitReader({ fetch: f.fetch, now: () => now });
     const results = await Promise.all([read(), read(), read()]);
-    assert.deepEqual(results[0], { status: 'ok', cancelledHidden: 1, tasks: [{ key: 'COC-385', title: 'Work', status: 'in_progress', priority: 'high', assignees: [{ email: 'me@example.com', name: 'Me' }], parentTaskKey: null, prUrl: 'https://github.com/team/repo/pull/1', updatedAt: '2026-11-11T12:00:00Z', estimateHours: 3, spentHours: 1 }] });
+    assert.deepEqual(results[0], { status: 'ok', cancelledTasks: [{ status: 'in_progress', assignees: [{ email: 'me@example.com' }], parentTaskKey: null }], tasks: [{ key: 'COC-385', title: 'Work', status: 'in_progress', priority: 'high', assignees: [{ email: 'me@example.com', name: 'Me' }], parentTaskKey: null, prUrl: 'https://github.com/team/repo/pull/1', updatedAt: '2026-11-11T12:00:00Z', estimateHours: 3, spentHours: 1 }] });
     assert.equal(f.lists, 1); assert.deepEqual(f.calls.map(c => c.method), ['initialize', 'notifications/initialized', 'tools/call']);
     assert.deepEqual(f.calls[2]?.params, { name: 'list_tasks' });
     assert.equal(f.headers[1]?.['mcp-session-id'], 'test-session'); assert.equal(f.headers[2]?.['mcp-session-id'], 'test-session');
@@ -129,10 +129,10 @@ test('mine/all-in-progress and subtasks preserve Cockpit order, with exact whole
 
 test('key linking accepts case-insensitive branch keys with dot and underscore suffixes without prefix collisions', () => {
   const tasks = slimCockpitTasks([task({ key: 'COC-12' }), task({ key: 'COC-123' }), task({ key: 'COC-12.2' })]);
-  assert.deepEqual(linkedCockpitTasks(tasks, 'feat/coc-12_fix').map(t => t.key), ['COC-12']);
-  assert.deepEqual(linkedCockpitTasks(tasks, 'feat/COC-12.fix').map(t => t.key), ['COC-12']);
-  assert.deepEqual(linkedCockpitTasks(tasks, 'feat/coc-12.2_fix').map(t => t.key), ['COC-12.2']);
-  assert.deepEqual(linkedCockpitTasks(tasks, 'feat/coc-123_fix').map(t => t.key), ['COC-123']);
+  assert.deepEqual(linkedCockpitTasks(tasks, null, 'feat/coc-12_fix').map(t => t.key), ['COC-12']);
+  assert.deepEqual(linkedCockpitTasks(tasks, null, 'feat/COC-12.fix').map(t => t.key), ['COC-12']);
+  assert.deepEqual(linkedCockpitTasks(tasks, null, 'feat/coc-12.2_fix').map(t => t.key), ['COC-12.2']);
+  assert.deepEqual(linkedCockpitTasks(tasks, null, 'feat/coc-123_fix').map(t => t.key), ['COC-123']);
   assert.deepEqual(linkedCockpitTasks(tasks, 'XCOC-12 COC-12x COC-12.20'), []);
 });
 
@@ -148,5 +148,30 @@ test('MCP sessions close after successful and failed refreshes, but never on cac
     now = 60000; f.setMode('tool-error'); assert.equal((await read()).status, 'unavailable');
     assert.equal(f.deletes.length, 2);
     f.setMode('stateless'); await read(); assert.equal(f.deletes.length, 2);
+  } finally { await f.cleanup(); }
+});
+
+
+test('key titles keep exact case and branches require a non-alphanumeric left boundary', () => {
+  const tasks = slimCockpitTasks([task({ key: 'COC-12' }), task({ key: 'COC-123' }), task({ key: 'COC-12.2' }), task({ key: 'FIX-1' })]);
+  for (const [title, expected] of [['_COC-12', ['COC-12']], ['COC-12.', ['COC-12']], ['fix-1 typo', []], ['xCOC-12', []], ['COC-12.20 COC-1234', []]] as const)
+    assert.deepEqual(linkedCockpitTasks(tasks, title).map(t => t.key), expected);
+  assert.deepEqual(linkedCockpitTasks(tasks, '', 'agent/coc-12_fix').map(t => t.key), ['COC-12']);
+  assert.deepEqual(linkedCockpitTasks(tasks, '', 'xcoc-12'), []);
+});
+
+test('hanging MCP DELETE never holds a read or subsequent refresh open', async () => {
+  const f = await fixture(); let now = 0; let signal: AbortSignal | undefined;
+  try {
+    const read = createCockpitReader({ now: () => now, fetch: async (input, init) => {
+      if (init?.method !== 'DELETE') return f.fetch(input, init);
+      signal = init.signal!;
+      return new Promise<Response>((_resolve, reject) => signal!.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+    } });
+    const timeout = new Promise<string>(resolve => { const timer = setTimeout(() => resolve('blocked'), 100); timer.unref(); });
+    const first = await Promise.race([read(), timeout]);
+    assert.notEqual(first, 'blocked'); assert.equal((first as any).status, 'ok');
+    now = 60000; assert.equal((await Promise.race([read(), timeout]) as any).status, 'ok');
+    assert.ok(signal); assert.equal(signal.aborted, false);
   } finally { await f.cleanup(); }
 });

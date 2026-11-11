@@ -44,6 +44,13 @@ var slimCockpitTasks = (input) => {
   }
   return result;
 };
+var slimCancelledTasks = (input) => {
+  if (!Array.isArray(input)) throw new Error("Invalid cancelled tasks");
+  return input.map((task) => {
+    if (!task || !COCKPIT_STATUSES.includes(task.status) || !Array.isArray(task.assignees) || task.assignees.some((a) => !a || !text(a.email, 320)) || !(task.parentTaskKey == null || text(task.parentTaskKey, 128) && keyPattern.test(task.parentTaskKey))) throw new Error("Invalid cancelled task");
+    return { status: task.status, assignees: task.assignees.map((a) => ({ email: a.email })), parentTaskKey: task.parentTaskKey ?? null };
+  });
+};
 
 // src/service/cockpit.ts
 var ENDPOINT = "https://cockpit.internal.angelsoftwares.ca/api/mcp/server";
@@ -192,8 +199,9 @@ var createCockpitReader = (options = {}) => {
       }
       if (JSON.stringify(tasks).includes(JSON.stringify(key).slice(1, -1))) return fail("Cockpit returned unsafe task data");
       const records = record(payload) ? payload.tasks : payload;
-      const cancelledHidden = records.filter((task) => task.cancelledAt != null).length;
-      cached = { status: "ok", tasks, cancelledHidden };
+      const cancelledTasks = slimCancelledTasks(records.filter((task) => task.cancelledAt != null));
+      if (JSON.stringify(cancelledTasks).includes(JSON.stringify(key).slice(1, -1))) return fail("Cockpit returned unsafe task data");
+      cached = { status: "ok", tasks, cancelledTasks };
       expires = now() + 6e4;
       return cached;
     } catch (error) {
@@ -202,16 +210,16 @@ var createCockpitReader = (options = {}) => {
     } finally {
       clearTimeout(timer);
       if (session && key) {
-        try {
+        void (async () => {
           const response = await request(ENDPOINT, {
             method: "DELETE",
             redirect: "error",
-            signal: AbortSignal.timeout(options.timeoutMs ?? 15e3),
+            signal: AbortSignal.timeout(2e3),
             headers: { Authorization: `Bearer ${key}`, "Mcp-Session-Id": session, "MCP-Protocol-Version": VERSION }
           });
           await response.body?.cancel();
-        } catch {
-        }
+        })().catch(() => {
+        });
       }
     }
   };

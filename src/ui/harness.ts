@@ -109,9 +109,14 @@ export const mountHarnessFeed = (host: Pick<HostClient, 'serviceRequest' | 'toas
   window.addEventListener('pagehide', onPageHide);
   window.addEventListener('pageshow', onPageShow);
   document.addEventListener('visibilitychange', onVisibility);
+  onAvailable(true); // Loading content allows the saved tab to restore on this load.
   void poll();
   return {
-    setScope: (value: ProjectScope) => { scope = value; render(); },
+    setScope: (value: ProjectScope) => {
+      const changed = JSON.stringify(scope) !== JSON.stringify(value);
+      scope = value;
+      if (changed) render();
+    },
     setCockpitTasks: (tasks: CockpitTask[]) => { cockpitTasks = tasks; annotate(); },
     dispose: () => {
       disposed = true;

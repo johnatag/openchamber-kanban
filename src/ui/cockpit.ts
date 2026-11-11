@@ -26,12 +26,13 @@ export const mountCockpitFeed = (host: Pick<HostClient, 'serviceRequest' | 'toas
   let timer: ReturnType<typeof setTimeout> | null = null;
   const render = () => {
     groups.replaceChildren();
-    onAvailable(!prefs.cockpitEmail || !result || result.status === 'unavailable' || result.tasks.some(task => task.status !== 'done') || (result.cancelledHidden ?? 0) > 0);
+    onAvailable(!prefs.cockpitEmail || !result || result.status === 'unavailable' || result.tasks.some(task => task.status !== 'done'));
     if (!prefs.cockpitEmail) { message.textContent = 'Set your Cockpit email to see your work.' + (result?.status === 'unavailable' ? ' Cockpit unavailable: ' + result.reason : ''); return; }
     if (!result) { message.textContent = 'Loading Cockpit tasks…'; return; }
     if (result.status === 'unavailable') { message.textContent = 'Cockpit unavailable: ' + result.reason; return; }
     const visible = filterCockpitTasks(result.tasks, prefs.cockpitEmail, prefs.cockpitMode, prefs.cockpitSubtasks);
-    message.textContent = (visible.length ? 'Read-only · updated every 60 seconds' : 'No matching open Cockpit tasks') + (result.cancelledHidden ? ' · ' + result.cancelledHidden + ' cancelled hidden' : '');
+    const cancelledHidden = filterCockpitTasks(result.cancelledTasks ?? [], prefs.cockpitEmail, prefs.cockpitMode, prefs.cockpitSubtasks).length;
+    message.textContent = (visible.length ? 'Read-only · updated every 60 seconds' : 'No matching open Cockpit tasks') + (cancelledHidden ? ' · ' + cancelledHidden + ' cancelled hidden' : '');
     for (const status of COCKPIT_STATUSES) {
       const tasks = visible.filter(t => t.status === status); if (!tasks.length) continue;
       const group = el('div', 'kb-column'); group.append(el('h3', 'kb-column-head', status.replaceAll('_', ' ')));
@@ -56,7 +57,7 @@ export const mountCockpitFeed = (host: Pick<HostClient, 'serviceRequest' | 'toas
   const changed = () => {
     if (!email.validity.valid || !email.value.trim()) { message.textContent = 'Enter a valid Cockpit email.'; return; }
     const next: CockpitPrefs = { cockpitEmail: email.value.trim().toLowerCase(), cockpitMode: mode.value === 'all_in_progress' ? 'all_in_progress' : 'mine', cockpitSubtasks: subtasks.checked };
-    void onPrefs(next).then(() => { if (!disposed) { setPrefs(next); } }, () => { if (!disposed) message.textContent = 'Could not save Cockpit preferences'; });
+    void onPrefs(next).catch(() => { if (!disposed) message.textContent = 'Could not save Cockpit preferences'; });
   };
   mountButton(controls, { label: 'Save email', variant: 'secondary', onClick: changed });
   mode.addEventListener('change', changed); subtasks.addEventListener('change', changed);

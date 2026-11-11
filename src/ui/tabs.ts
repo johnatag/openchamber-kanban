@@ -27,16 +27,20 @@ export const mountBoardTabs = (root: Element, onChange: (tab: BoardTab) => void)
     return { id, button, panel };
   });
   const render = () => {
-    const selected = available[desired] ? desired : 'board';
+    if (!available[desired]) desired = 'board';
+    const selected = desired;
+    const focusHidden = entries.some(entry => !available[entry.id] && document.activeElement === entry.button);
     for (const entry of entries) {
       entry.button.hidden = !available[entry.id];
       entry.button.setAttribute('aria-selected', String(entry.id === selected));
       entry.button.tabIndex = entry.id === selected ? 0 : -1;
       entry.panel.hidden = entry.id !== selected;
     }
+    if (focusHidden) entries.find(entry => entry.id === selected)!.button.focus();
   };
   render();
   return {
+    selected: () => desired,
     panels: Object.fromEntries(entries.map(entry => [entry.id, entry.panel])) as Record<BoardTab, HTMLDivElement>,
     setSelected: (tab: BoardTab) => { desired = tab; render(); },
     setAvailable: (id: 'harness' | 'cockpit', value: boolean) => { available[id] = value; render(); },

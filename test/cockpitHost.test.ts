@@ -10,7 +10,7 @@ test('Cockpit host uses only the fixed route and preserves unavailable reasons',
     return { status: 200, body: JSON.stringify({ status: 'unavailable', reason: 'Cockpit authentication failed' }) };
   } });
   assert.deepEqual(result, { status: 'unavailable', reason: 'Cockpit authentication failed' });
-  for (const response of [{ status: 500, body: '{}' }, { status: 200, body: 'not JSON' }, { status: 200, body: '{"status":"ok"}' }, { status: 200, body: '{"status":"ok","tasks":[{}]}' }]) {
+  for (const response of [{ status: 500, body: '{}' }, { status: 200, body: 'not JSON' }, { status: 200, body: '{"status":"ok"}' }, { status: 200, body: '{"status":"ok","tasks":[{}]}' }, { status: 200, body: JSON.stringify({ status: 'ok', tasks: [], cancelledTasks: [{ status: 'invalid', assignees: [] }] }) }]) {
     assert.equal((await fetchCockpitTasks({ serviceRequest: async () => response })).status, 'unavailable');
   }
   assert.equal((await fetchCockpitTasks({ serviceRequest: async () => { throw new Error('offline'); } })).status, 'unavailable');

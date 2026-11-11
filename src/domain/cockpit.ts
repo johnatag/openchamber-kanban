@@ -6,7 +6,8 @@ export type CockpitTask = {
   parentTaskKey: string | null; prUrl: string | null; updatedAt: string;
   estimateHours: number | null; spentHours: number | null;
 };
-export type CockpitResponse = { status: 'ok'; tasks: CockpitTask[]; cancelledHidden?: number } | { status: 'unavailable'; reason: string };
+export type CockpitFilterTask = Pick<CockpitTask, 'status' | 'parentTaskKey'> & { assignees: { email: string }[] };
+export type CockpitResponse = { status: 'ok'; tasks: CockpitTask[]; cancelledTasks?: CockpitFilterTask[] } | { status: 'unavailable'; reason: string };
 export type CockpitMode = 'mine' | 'all_in_progress';
 const keyPattern = /^[A-Z]{2,6}-\d+(\.\d+)*$/;
 const text = (v: unknown, max = 4096): v is string => typeof v === 'string' && v.length <= max;
@@ -36,12 +37,22 @@ export const slimCockpitTasks = (input: unknown): CockpitTask[] => {
   }
   return result;
 };
-export const filterCockpitTasks = (tasks: readonly CockpitTask[], email: string, mode: CockpitMode, includeSubtasks: boolean) => {
+// Only the fields needed to count cancelled tasks within the active filters.
+export const slimCancelledTasks = (input: unknown): CockpitFilterTask[] => {
+  if (!Array.isArray(input)) throw new Error('Invalid cancelled tasks');
+  return input.map(task => {
+    if (!task || !COCKPIT_STATUSES.includes(task.status) || !Array.isArray(task.assignees) ||
+      task.assignees.some((a: any) => !a || !text(a.email, 320)) ||
+      !(task.parentTaskKey == null || (text(task.parentTaskKey, 128) && keyPattern.test(task.parentTaskKey)))) throw new Error('Invalid cancelled task');
+    return { status: task.status, assignees: task.assignees.map((a: any) => ({ email: a.email })), parentTaskKey: task.parentTaskKey ?? null };
+  });
+};
+export const filterCockpitTasks = <T extends CockpitFilterTask>(tasks: readonly T[], email: string, mode: CockpitMode, includeSubtasks: boolean) => {
   const normalized = email.trim().toLowerCase();
   return tasks.filter(t => t.status !== 'done' && (includeSubtasks || !t.parentTaskKey) &&
     (mode === 'all_in_progress' ? t.status === 'in_progress' : normalized !== '' && t.assignees.some(a => a.email.trim().toLowerCase() === normalized)));
 };
-export const linkedCockpitTasks = (tasks: readonly CockpitTask[], ...sources: (string | null | undefined)[]) => {
-  const keys = new Set(sources.flatMap(s => [...(s ?? '').matchAll(/(?<![A-Za-z0-9])[A-Z]{2,6}-\d+(?:\.\d+)*(?![A-Za-z0-9]|\.\d)/gi)].map(m => m[0].toUpperCase())));
+export const linkedCockpitTasks = (tasks: readonly CockpitTask[], title: string | null | undefined, ...branches: (string | null | undefined)[]) => {
+  const keys = new Set([title, ...branches].flatMap((s, index) => [...(s ?? '').matchAll(new RegExp(String.raw`(?<![A-Za-z0-9])[A-Z]{2,6}-\d+(?:\.\d+)*(?![A-Za-z0-9]|\.\d)`, index === 0 ? 'g' : 'gi'))].map(m => m[0].toUpperCase())));
   return tasks.filter(t => keys.has(t.key));
 };

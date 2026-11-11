@@ -24,14 +24,14 @@ class DomNode extends EventTarget {
   setAttribute(name: string, value: string) { this.attributes.set(name, value); }
   getAttribute(name: string) { return this.attributes.get(name) ?? null; }
   removeAttribute(name: string) { this.attributes.delete(name); }
-  focus() {}
+  focus() { (document as unknown as { activeElement: DomNode }).activeElement = this; }
   querySelectorAll(selector: string): DomNode[] { return this.children.flatMap((node) => [...(node.matches(selector) ? [node] : []), ...node.querySelectorAll(selector)]); }
   querySelector(selector: string) { return this.querySelectorAll(selector)[0] ?? null; }
   matches(selector: string) { return selector.startsWith('.') ? this.className.split(' ').includes(selector.slice(1)) : this.tagName === selector; }
 }
 const setup = () => {
   const head = new DomNode('head'); const sdkStyle = new DomNode('style'); sdkStyle.id = 'oc-sdk-ui-style'; head.append(sdkStyle);
-  const doc = Object.assign(new EventTarget(), { hidden: false, head, createElement: (tag: string) => new DomNode(tag), createElementNS: (_ns: string, tag: string) => new DomNode(tag), getElementById: (id: string) => head.children.find((node) => node.id === id) ?? null });
+  const doc = Object.assign(new EventTarget(), { hidden: false, activeElement: null as DomNode | null, head, createElement: (tag: string) => new DomNode(tag), createElementNS: (_ns: string, tag: string) => new DomNode(tag), getElementById: (id: string) => head.children.find((node) => node.id === id) ?? null });
   const win = new EventTarget();
   Object.assign(globalThis, { document: doc, window: win, HTMLStyleElement: DomNode, HTMLElement: DomNode, HTMLInputElement: DomNode, HTMLTextAreaElement: DomNode, Node: DomNode });
   const root = new DomNode('root');
@@ -214,6 +214,8 @@ const setScope = async (fake: ReturnType<typeof fakeHost>, root: DomNode, projec
   fake.stored.set('prefs', { ...(fake.stored.get('prefs') as object), projectId });
   click(root, 'Refresh'); await settle();
 };
+const cancelledTask = (parentTaskKey: string | null = null, email = 'me@example.com') => ({ status: 'in_progress', assignees: [{ email }], parentTaskKey });
+const openCockpitTask = { key: 'COC-12', title: 'Remote', status: 'in_progress', assignees: [{ email: 'me@example.com' }], updatedAt: '2026-11-11T12:00:00Z' };
 const harnessLane = (id: string, project: string | null) => ({ v: 1, id, title: id, project, branch: 'feat/COC-12', kind: 'review', pid: 1, startedAt: '2026-11-11T12:00:00Z', report: null, log: null, status: 'review', reportFile: null, logFile: null });
 
 test('tabs default to Board, hide empty sources, support arrow keys and persist the selection', async () => {
@@ -250,7 +252,7 @@ test('Personal and untagged projects never call Cockpit, Work requires email, an
   const dom = setup(); const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] }); let polls = 0;
   fake.host.serviceRequest = async request => {
     if (request.path === '/cockpit-tasks') polls++;
-    return { status: 200, body: JSON.stringify(request.path === '/cockpit-tasks' ? { status: 'ok', tasks: [], cancelledHidden: 3 } : { file: 'missing', lanes: [], rejected: 0, rejectedLines: [], truncated: false }) };
+    return { status: 200, body: JSON.stringify(request.path === '/cockpit-tasks' ? { status: 'ok', tasks: [openCockpitTask], cancelledTasks: Array.from({ length: 3 }, () => cancelledTask()) } : { file: 'missing', lanes: [], rejected: 0, rejectedLines: [], truncated: false }) };
   };
   fake.stored.set('prefs', { cockpitEmail: 'me@example.com' });
   const board = mountKanbanBoard(fake.host, dom.element);
@@ -313,7 +315,7 @@ test('scope changes discard in-flight Cockpit data and never restart polling in 
   fake.host.serviceRequest = async request => {
     if (request.path !== '/cockpit-tasks') return { status: 200, body: JSON.stringify({ file: 'missing', lanes: [], rejected: 0, rejectedLines: [], truncated: false }) };
     polls++; await gate.promise;
-    return { status: 200, body: JSON.stringify({ status: 'ok', tasks: [], cancelledHidden: 9 }) };
+    return { status: 200, body: JSON.stringify({ status: 'ok', tasks: [], cancelledTasks: Array.from({ length: 9 }, () => cancelledTask()) }) };
   };
   const board = mountKanbanBoard(fake.host, dom.element);
   try {
@@ -340,17 +342,188 @@ test('failed project tag storage leaves Personal scope intact and surfaces the e
   } finally { board.dispose(); }
 });
 
-test('Cockpit hides a successfully empty source and reappears when polling finds work', async (t) => {
-  const dom = setup(); const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] }); let cancelledHidden = 0;
+test('cancelled counts follow filters, never keep a tab visible, and reappearing tabs do not steal selection', async (t) => {
+  const dom = setup(); const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] }); let tasks: unknown[] = [];
   fake.stored.set('prefs', { projectTags: { p: 'work' }, cockpitEmail: 'me@example.com', activeTab: 'cockpit' });
-  fake.host.serviceRequest = async request => ({ status: 200, body: JSON.stringify(request.path === '/cockpit-tasks' ? { status: 'ok', tasks: [], cancelledHidden } : { file: 'missing', lanes: [], rejected: 0, rejectedLines: [], truncated: false }) });
+  fake.host.serviceRequest = async request => ({ status: 200, body: JSON.stringify(request.path === '/cockpit-tasks' ? { status: 'ok', tasks, cancelledTasks: [cancelledTask(), cancelledTask('COC-12'), cancelledTask(null, 'someone@example.com')] } : { file: 'missing', lanes: [], rejected: 0, rejectedLines: [], truncated: false }) });
   const board = mountKanbanBoard(fake.host, dom.element);
   try {
     await settle(); assert.ok(tabs(dom.root).find(n => n.textContent === 'Cockpit')!.hidden);
     assert.equal(selectedTab(dom.root)?.textContent, 'Board');
-    cancelledHidden = 2; t.mock.timers.tick(60000); await settle();
+    const section = dom.root.querySelector('.kb-cockpit')!;
+    assert.match(section.textContent, /1 cancelled hidden/);
+    tasks = [openCockpitTask]; t.mock.timers.tick(60000); await settle();
     assert.equal(tabs(dom.root).find(n => n.textContent === 'Cockpit')!.hidden, false);
-    assert.equal(selectedTab(dom.root)?.textContent, 'Cockpit');
-    assert.match(dom.root.querySelector('.kb-cockpit')!.textContent, /2 cancelled hidden/);
+    assert.equal(selectedTab(dom.root)?.textContent, 'Board');
+    click(dom.root, 'Refresh'); await settle();
+    assert.equal(selectedTab(dom.root)?.textContent, 'Board');
+    click(dom.root, 'Cockpit');
+    Object.assign(section.querySelector('input')!, { validity: { valid: true } });
+    const sub = section.querySelectorAll('input')[1]!; Object.assign(sub, { checked: true }); sub.dispatchEvent(new Event('change')); await settle();
+    assert.match(section.textContent, /2 cancelled hidden/);
+    const mode = section.querySelector('select')!; mode.value = 'all_in_progress'; mode.dispatchEvent(new Event('change')); await settle();
+    assert.match(section.textContent, /3 cancelled hidden/);
+    const search = dom.root.querySelectorAll('input').find(n => n.getAttribute('placeholder') === 'Search tasks, branch, session…' || (n as any).placeholder === 'Search tasks, branch, session…')!;
+    assert.ok(search.parentNode!.parentNode!.hidden);
+    const cockpitTab = selectedTab(dom.root)!; cockpitTab.focus();
+    tasks = []; t.mock.timers.tick(60000); await settle();
+    assert.equal(selectedTab(dom.root)?.textContent, 'Board');
+    assert.equal(dom.doc.activeElement, selectedTab(dom.root));
+    assert.equal(search.parentNode!.parentNode!.hidden, false);
+  } finally { board.dispose(); }
+});
+
+test('REVIEW race: tag Work->Personal then quick tab click; queued tab save preserves Personal across reload', async (t) => {
+  const dom = setup(); const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] });
+  fake.stored.set('prefs', { projectId: 'p', projectTags: { p: 'work' }, cockpitEmail: 'me@example.com' });
+  let polls = 0;
+  fake.host.serviceRequest = async request => { if (request.path === '/cockpit-tasks') polls++; return { status: 200, body: JSON.stringify(request.path === '/cockpit-tasks' ? { status: 'ok', tasks: [], cancelledHidden: 1 } : { file: 'missing', lanes: [], rejected: 0, rejectedLines: [], truncated: false }) }; };
+  let board = mountKanbanBoard(fake.host, dom.element);
+  await settle(); assert.equal(polls, 1);
+  // Host storage that completes writes in issue order after a delay.
+  const queue: [string, unknown][] = []; const gate = deferred<void>();
+  const origSet = fake.host.storage.set;
+  fake.host.storage.set = (async (key: string, value: unknown) => { queue.push([key, value]); await gate.promise; }) as any;
+  const tag = dom.root.querySelectorAll('select').find(n => n.getAttribute('aria-label') === 'Project type')!;
+  tag.value = 'personal'; tag.dispatchEvent(new Event('change'));
+  click(dom.root, 'Board'); // Save a tab while the tag write is pending.
+  gate.resolve(); await settle();
+  for (const [k, v] of queue) fake.stored.set(k, v);
+  fake.host.storage.set = origSet;
+  assert.equal((fake.stored.get('prefs') as any).projectTags.p, 'personal');
+  board.dispose();
+  const before = polls;
+  board = mountKanbanBoard(fake.host, dom.element); await settle();
+  assert.equal(polls - before, 0);
+  board.dispose();
+});
+
+test('REVIEW race: Cockpit email save in flight preserves a Work->Personal tag change', async (t) => {
+  const dom = setup(); const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] });
+  fake.stored.set('prefs', { projectId: 'p', projectTags: { p: 'work' }, cockpitEmail: 'me@example.com', activeTab: 'cockpit' });
+  let polls = 0;
+  fake.host.serviceRequest = async request => { if (request.path === '/cockpit-tasks') polls++; return { status: 200, body: JSON.stringify(request.path === '/cockpit-tasks' ? { status: 'ok', tasks: [], cancelledHidden: 1 } : { file: 'missing', lanes: [], rejected: 0, rejectedLines: [], truncated: false }) }; };
+  const board = mountKanbanBoard(fake.host, dom.element);
+  await settle();
+  const gates: ReturnType<typeof deferred<void>>[] = [];
+  const origSet = fake.host.storage.set;
+  fake.host.storage.set = (async (key: string, value: unknown) => { const g = deferred<void>(); gates.push(g); await g.promise; fake.stored.set(key, value); }) as any;
+  const email = dom.root.querySelector('.kb-cockpit')!.querySelector('input')!;
+  Object.assign(email, { value: 'other@example.com', validity: { valid: true } }); click(dom.root, 'Save email');
+  await settle(); // The email snapshot is already in storage when Personal is chosen.
+  const tag = dom.root.querySelectorAll('select').find(n => n.getAttribute('aria-label') === 'Project type')!;
+  tag.value = 'personal'; tag.dispatchEvent(new Event('change'));
+  const p1 = polls;
+  // Complete in reverse order if writes overlap; a serial writer starts the second later.
+  gates[1]?.resolve(); await settle();
+  gates[0]!.resolve(); await settle();
+  gates[1]?.resolve(); await settle();
+  fake.host.storage.set = origSet;
+  assert.equal(tag.value, 'personal');
+  assert.equal(tabs(dom.root).find(n => n.textContent === 'Cockpit')!.hidden, true);
+  assert.equal(polls - p1, 0);
+  assert.equal((fake.stored.get('prefs') as any).projectTags.p, 'personal');
+  assert.equal((fake.stored.get('prefs') as any).cockpitEmail, 'other@example.com');
+  board.dispose();
+});
+
+
+test('Personal takes effect before storage completes and rolls back only on failure', async (t) => {
+  const dom = setup(); const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] }); let polls = 0;
+  fake.stored.set('prefs', { projectId: 'p', projectTags: { p: 'work' }, cockpitEmail: 'me@example.com' });
+  fake.host.serviceRequest = async request => { if (request.path === '/cockpit-tasks') polls++; return { status: 200, body: JSON.stringify(request.path === '/cockpit-tasks' ? { status: 'ok', tasks: [openCockpitTask] } : { file: 'missing', lanes: [], rejected: 0, rejectedLines: [], truncated: false }) }; };
+  const board = mountKanbanBoard(fake.host, dom.element);
+  try {
+    await settle(); const gate = deferred<void>();
+    fake.host.storage.set = async () => { await gate.promise; throw new Error('Storage unavailable'); };
+    const tag = dom.root.querySelectorAll('select').find(n => n.getAttribute('aria-label') === 'Project type')!;
+    tag.value = 'personal'; tag.dispatchEvent(new Event('change'));
+    assert.equal(tabs(dom.root).find(n => n.textContent === 'Cockpit')!.hidden, true);
+    const before = polls; t.mock.timers.tick(120000); dom.win.dispatchEvent(new Event('pageshow')); await settle(); assert.equal(polls, before);
+    gate.resolve(); await settle();
+    assert.equal(tag.value, 'work'); assert.match(dom.root.textContent, /Storage unavailable/);
+  } finally { board.dispose(); }
+});
+
+test('deleted project tags are pruned only when the project list is ready', async () => {
+  const dom = setup(); const fake = fakeHost(); let emit!: (snapshot: any) => void;
+  fake.host.onProjects = async listener => { emit ??= listener; listener({ kind: 'projects', state: 'loading', projects: [] }); return () => {}; };
+  fake.stored.set('prefs', { projectTags: { p: 'work', gone: 'work' } });
+  const board = mountKanbanBoard(fake.host, dom.element);
+  try {
+    await settle(); assert.deepEqual((fake.stored.get('prefs') as any).projectTags, { p: 'work', gone: 'work' });
+    emit({ state: 'ready', projects: [{ id: 'p', name: 'Renamed', directory: '/project' }] }); await settle();
+    assert.deepEqual((fake.stored.get('prefs') as any).projectTags, { p: 'work' });
+  } finally { board.dispose(); }
+});
+
+test('unrelated board renders preserve Harness cards and their Copied state', async (t) => {
+  const dom = setup(); const fake = fakeHost();
+  const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { clipboard: { writeText: async () => {} } } });
+  t.after(() => { if (originalNavigator) Object.defineProperty(globalThis, 'navigator', originalNavigator); });
+  fake.host.serviceRequest = async () => ({ status: 200, body: JSON.stringify({ file: 'ok', lanes: [{ ...harnessLane('Report', '/project'), report: '/tmp/report.md', reportFile: { path: '/tmp/report.md', exists: true, mtime: 1 } }], rejected: 0, rejectedLines: [], truncated: false }) });
+  const board = mountKanbanBoard(fake.host, dom.element);
+  try {
+    await settle(); const section = dom.root.querySelector('.kb-harness')!;
+    click(section, 'Copy report path'); await settle();
+    assert.match(section.textContent, /Copied/);
+    const search = dom.root.querySelectorAll('input').find(n => n.getAttribute('role') === 'searchbox')!;
+    search.value = 'unrelated'; search.dispatchEvent(new Event('input')); await settle();
+    assert.match(section.textContent, /Copied/);
+  } finally { board.dispose(); }
+});
+
+test('a refresh started before Personal cannot restore stale loaded preferences', async (t) => {
+  const dom = setup(); const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] }); let polls = 0;
+  fake.stored.set('prefs', { projectId: 'p', projectTags: { p: 'work' }, cockpitEmail: 'me@example.com' });
+  fake.host.serviceRequest = async request => { if (request.path === '/cockpit-tasks') polls++; return { status: 200, body: JSON.stringify(request.path === '/cockpit-tasks' ? { status: 'ok', tasks: [openCockpitTask] } : { file: 'missing', lanes: [] }) }; };
+  const board = mountKanbanBoard(fake.host, dom.element);
+  try {
+    await settle(); const gate = deferred<void>(); const get = fake.host.storage.get;
+    fake.host.storage.get = async key => { const snapshot = await get(key); if (key === 'prefs') await gate.promise; return snapshot; };
+    click(dom.root, 'Refresh'); await settle();
+    const tag = dom.root.querySelectorAll('select').find(n => n.getAttribute('aria-label') === 'Project type')!;
+    tag.value = 'personal'; tag.dispatchEvent(new Event('change')); await settle();
+    const before = polls; gate.resolve(); await settle();
+    t.mock.timers.tick(120000); dom.win.dispatchEvent(new Event('pageshow')); await settle();
+    assert.equal(tag.value, 'personal'); assert.equal(polls, before);
+    assert.equal((fake.stored.get('prefs') as any).projectTags.p, 'personal');
+  } finally { board.dispose(); }
+});
+
+test('a failed email write rolls back only its fields and the queue still saves Personal', async (t) => {
+  const dom = setup(); const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] });
+  fake.stored.set('prefs', { projectId: 'p', projectTags: { p: 'work' }, cockpitEmail: 'me@example.com' });
+  fake.host.serviceRequest = async request => ({ status: 200, body: JSON.stringify(request.path === '/cockpit-tasks' ? { status: 'ok', tasks: [openCockpitTask] } : { file: 'missing', lanes: [] }) });
+  const board = mountKanbanBoard(fake.host, dom.element);
+  try {
+    await settle(); const gate = deferred<void>(); const set = fake.host.storage.set; let first = true;
+    fake.host.storage.set = async (key, value) => { if (key === 'prefs' && first) { first = false; await gate.promise; throw new Error('Storage unavailable'); } await set(key, value); };
+    const email = dom.root.querySelector('.kb-cockpit')!.querySelector('input')!;
+    Object.assign(email, { value: 'new@example.com', validity: { valid: true } }); click(dom.root, 'Save email'); await settle();
+    const tag = dom.root.querySelectorAll('select').find(n => n.getAttribute('aria-label') === 'Project type')!;
+    tag.value = 'personal'; tag.dispatchEvent(new Event('change'));
+    gate.resolve(); await settle();
+    const prefs = fake.stored.get('prefs') as any;
+    assert.equal(prefs.projectTags.p, 'personal'); assert.equal(prefs.cockpitEmail, 'me@example.com');
+    assert.equal(tag.value, 'personal'); assert.equal(tabs(dom.root).find(n => n.textContent === 'Cockpit')!.hidden, true);
+    assert.match(dom.root.textContent, /Could not save Cockpit preferences/);
+  } finally { board.dispose(); }
+});
+
+test('a saved Harness tab restores while its initial load is pending, then never jumps back after hiding', async () => {
+  const dom = setup(); const fake = fakeHost(); const gate = deferred<void>(); let lanes: unknown[] = [];
+  fake.stored.set('prefs', { activeTab: 'harness' });
+  fake.host.serviceRequest = async () => { await gate.promise; return { status: 200, body: JSON.stringify({ file: 'ok', lanes, rejected: 0, rejectedLines: [] }) }; };
+  let board = mountKanbanBoard(fake.host, dom.element);
+  try {
+    await settle(); assert.equal(selectedTab(dom.root)?.textContent, 'Harness');
+    gate.resolve(); await settle(); assert.equal(selectedTab(dom.root)?.textContent, 'Board');
+    lanes = [harnessLane('Returns', '/project')]; dom.win.dispatchEvent(new Event('pageshow')); await settle();
+    assert.equal(tabs(dom.root).find(n => n.textContent === 'Harness')!.hidden, false);
+    assert.equal(selectedTab(dom.root)?.textContent, 'Board');
+    board.dispose(); board = mountKanbanBoard(fake.host, dom.element); await settle();
+    assert.equal(selectedTab(dom.root)?.textContent, 'Harness');
   } finally { board.dispose(); }
 });
