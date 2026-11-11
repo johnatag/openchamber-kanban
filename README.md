@@ -44,7 +44,7 @@ Open the task (click it, or click Edit), and the border goes away.
 
 ### Tasks can also appear by themselves
 
-If you start a chat in OpenChamber another way — for example, from the sidebar — this board can still find it and make a task for it. The board adopts new, active sessions while it is open, and checks again when you open it. This only works for sessions created **after** you first open the board. It does not look back at older sessions. Sessions started with **Start Agent** are linked to the task you started from, not adopted as another task.
+If you start a chat in OpenChamber another way — for example, from the sidebar — this board can still find it and make a task for it. The board adopts new, active sessions while it is open, and checks again when you open it. This only works for sessions created **after** you first open the board. Automatic adoption does not look back at older sessions. Click **Import running sessions** to add eligible active sessions of any age from all registered projects. Import keeps the same status and title rules, skips subagents, archived sessions, linked sessions, and sessions whose task you deleted, and leaves the automatic-adoption cutoff unchanged. Sessions started with **Start Agent** are linked to the task you started from, not adopted as another task.
 
 ## How it works (a simple picture)
 
@@ -97,16 +97,20 @@ npm run check
 
 **Requirement:** OpenChamber version 1.24.0 or newer. Older versions do not have the Extensions feature at all.
 
-## What the local service does — and nothing else
+## What the local service does
 
-The approval screen calls this "Run a local service" and says it runs with your full user access. That sounds broad, so here is exactly what it does:
+The approval screen calls this "Run a local service" and says it runs with your full user access. Here is what it does:
 
-- It runs **one command only**: `git for-each-ref`, which **reads** your repository's branch names. It does not read file contents, does not read commit messages, does not write anything, and does not touch your git history.
-- It only runs for a project directory already in your OpenChamber project list — never any other folder.
-- It only answers OpenChamber itself, on your own computer. It never connects to the internet on its own.
-- Its only purpose is filling in the "Based on" dropdown in **Start Agent** with your repository's real branch names, so you can search for one instead of typing it by hand.
+- It runs one command: `git for-each-ref`, which reads repository branch names for the **Based on** dropdown in **Start Agent**. It does not write files or change git history. The board requests branches only for registered projects.
+- It also reads one harness feed file: `$AIDE_LANES_FILE`, if supplied to the service as an absolute path, otherwise `~/.local/share/aide/lanes.jsonl`. Requests cannot choose a different feed file. The SDK currently forwards only a limited environment, so a variable set in your shell may not reach the host-spawned service; the default path works without it.
+- For feed records it checks whether the PID exists and whether the named report and log files exist, including modification times. It never reads report or log contents.
+- It only answers authenticated OpenChamber requests on your computer. It never connects to the internet on its own.
 
-If you don't approve it, or it isn't running, "Based on" still works — it just offers fewer branches (only ones that already have a worktree) plus "Use project default".
+The board's separate **Harness** section shows up to 200 newest lanes, reviews, and gates as read-only cards. It polls every 15 seconds while the board is visible. These cards are not tasks, cannot be dragged, and do not affect the task count. **Running** means the PID exists with no recorded end; **Review** means an end was recorded or a report exists; **Failed** means the feed explicitly reported failure; **Lost** means the PID is gone with neither an end nor a report. A report path has a copy button; if iframe clipboard access is blocked, it opens the host's copy toast.
+
+A missing feed is shown as missing, and malformed records are skipped with their line numbers shown. An unavailable service is shown as an error. Without the service, **Based on** still offers worktree branches and **Use project default**.
+
+Manifest permissions are unchanged; this update requires no new capability approval.
 
 ## What this extension cannot do
 

@@ -57,3 +57,17 @@ export const sessionTitleForTask = (task: Pick<Task, 'title' | 'description'>): 
   if (firstLine) return firstLine.slice(0, TITLE_MAX);
   return title || DEFAULT_TASK_TITLE;
 };
+
+/** Explicit import shares adoption rules but deliberately has no watermark. */
+export const selectSessionsToImport = <T extends OrphanCandidate>(sessions: readonly T[], excludedIds: ReadonlySet<string>) => {
+  const claimed = new Set(excludedIds);
+  const selected: { session: T; status: TaskStatus }[] = [];
+  for (const session of sessions) {
+    if (!isAdoptable(session, claimed)) continue;
+    const status = initialStatusForNewSession(session);
+    if (!status) continue;
+    claimed.add(session.id);
+    selected.push({ session, status });
+  }
+  return selected;
+};

@@ -253,6 +253,9 @@ html,body{margin:0;min-height:100%;background:var(--oc-bg);color:var(--oc-fg);fo
 .kb-column-body{display:flex;flex-direction:column;gap:8px;padding:10px;overflow-y:auto;flex:1;min-height:40px}
 .kb-column-empty{font-size:12px;color:var(--oc-muted);padding:8px 2px}
 .kb-card{background:var(--oc-elevated);color:var(--oc-elevated-fg);border:1px solid var(--oc-border);border-radius:9px;padding:10px;cursor:pointer;display:flex;flex-direction:column;gap:6px}
+.kb-harness-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,260px),1fr));gap:12px}
+.kb-harness-card{cursor:default;min-width:0}
+.kb-harness-path{font:11px var(--oc-mono);overflow-wrap:anywhere}
 .kb-card:hover{border-color:var(--oc-hover)}
 .kb-card.kb-dragging{opacity:.4}
 .kb-card.kb-card-needs-attention{border-color:var(--oc-warning);border-left-width:3px}

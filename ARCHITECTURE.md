@@ -25,7 +25,7 @@ Requires OpenChamber `>=1.24.0` — the Extensions SDK (`Settings → Extensions
 |---|---|
 | `sessions` | `listProjects`/`onProjects`, `listSessions`/`onSessions`, `listWorktrees`/`onWorktrees`, `startSession`, `openSession` — reading project/session/worktree state and creating or opening sessions. |
 | `prompt` | Permits `startSession` to send its `text` field as the agent's first message. The returned `sent` value is checked because session creation can succeed without the message being delivered. |
-| `service` (auto-added by declaring `contributes.service`) | The local git-branch-reading service, see below. |
+| `service` (auto-added by declaring `contributes.service`) | The local branch and harness-feed service, see below. |
 
 **Capability approval is all-or-nothing.** The host's own grant endpoint (`PUT /api/guests/:id/capabilities`) accepts only the full requested list or `[]` — there is no partial grant. Installing this extension means accepting all three capabilities together; there is no way to get the Kanban board without also being asked about the local service.
 
@@ -41,7 +41,8 @@ openchamber-kanban/
       sync.ts            # agent activity → task status mapping — pure
       worktree.ts         # worktree/branch picker logic, local service response parsing — pure
       unlink.ts            # link health: whether a linked session/worktree provably still exists — pure
-      autoTask.ts          # orphan-session eligibility + initial status + title — pure
+      autoTask.ts          # orphan-session eligibility + explicit import selection + initial status + title — pure
+      harness.ts           # JSONL record parsing, status mapping and newest-200 selection — pure
     store/
       taskStore.ts      # one host.storage key per task: task:<id>
       prefs.ts            # board filters + last-open task: host.storage key "prefs"
@@ -52,16 +53,20 @@ openchamber-kanban/
       worktreeSync.ts       # live onWorktrees watcher → worktree-deleted unlinks
       orphanSessions.ts     # live onProjects+onSessions watcher → sessions with no task yet
       branchService.ts        # calls the local git-branch service; null on any failure
+      harnessService.ts       # fixed harness route + validated service response
     ui/
       dnd.ts            # drop-target math — pure, no DOM
       styles.ts           # CSS using the host's --oc-* theme tokens
       dom.ts                # element() helper
       board.ts               # the Kanban board
+      harness.ts             # read-only activity section + visibility-scoped polling
       detail.ts                # task detail dialog
     page.ts             # full-screen page entry (contributes.page)
     panel.ts              # rail panel entry: summary + badge
     service/
-      main.ts           # local git-branch service source (Node, not browser)
+      main.ts           # local service startup (Node, not browser)
+      server.ts         # authenticated branch and harness HTTP routes
+      harness.ts        # feed read + PID and report/log metadata checks
   panel/
     index.html, page.html   # HTML shells
     main.js, page.js          # esbuild IIFE output
@@ -164,11 +169,27 @@ Clicking **Start Agent**:
 6. Clears the saved open-task preference and waits for that storage write to finish before calling `host.openSession(result.sessionId)`. The dialog therefore does not reopen when the user returns to the board.
 7. On failure (`sessionId: null`), surfaces the host's own failure reason and keeps the worktree's directory in the message rather than deleting anything.
 
-## The local git-branch service
+## Explicit session import
+
+**Import running sessions** fetches sessions for every registered project. Pure `selectSessionsToImport` in `domain/autoTask.ts` applies structural eligibility and `initialStatusForNewSession`, deduplicating ids and excluding linked, dismissed, and already-claimed sessions. It has no watermark input. The board uses the same adoption writer and title rules as auto-adoption, with only the age check bypassed. Session ids are claimed synchronously before storage writes; import is disabled until tasks and projects have loaded, and reload waits for pending adoptions. Neither the cutoff nor dismissed ids are changed by import.
+
+## Harness activity feed
+
+`src/service/main.ts` chooses one absolute feed path at startup: `AIDE_LANES_FILE` or `~/.local/share/aide/lanes.jsonl`. Relative overrides fail startup. The SDK's service environment allowlist may omit a shell-set override, in which case the default is used. `src/service/server.ts` exposes authenticated `GET /harness-lanes`, rejecting query parameters and request bodies, and delegates to `src/service/harness.ts`. No request can select a feed path.
+
+`domain/harness.ts` validates v1 JSONL records, including required fields, positive integer PIDs, absolute-or-null paths, and ISO timestamps with explicit timezone offsets. Each later valid record replaces the previous valid record with its id; malformed records are skipped and counted in `rejected` and `rejectedLines` (1-based). Records are sorted by their start instant and capped at 200 before filesystem/process checks.
+
+The service reads only the feed contents. It uses `process.kill(pid, 0)` (EPERM means the PID exists) and filesystem metadata for report/log paths. Returned metadata is `{path, exists, mtime}`, with milliseconds for mtime; contents are never read. Explicit failed outcome wins; otherwise an alive PID without endedAt is running, endedAt or an existing report is review, and a dead PID without either is lost. Done is never inferred. Missing feed returns exactly `{lanes: [], file: "missing"}`; other read or metadata errors return HTTP 500 rather than a false status claim.
+
+`host/harnessService.ts` uses a narrow `Pick<HostClient, 'serviceRequest'>` and validates the service response. `ui/harness.ts` mounts a separate read-only Harness section with title, kind, project name, status, age, and copyable report path. It polls every 15 seconds, suspends while the document is hidden, and clears its timer/listener on board disposal. Failed requests clear stale cards and show an error. Harness cards never enter task storage, task status sync, task counts, or drag/drop.
+
+Existing manifest permissions remain sufficient: filesystem metadata and PID checks need no new SDK capability. Re-approval is not required.
+
+## The local branch and harness service
 
 Declared via `contributes.service` with `permissions.exec: ["git"]` — the only way to list a repository's real branches, since the SDK itself has no API for this (confirmed by enumerating every `HostClient` method).
 
-- `src/service/main.ts`, built to `service/main.js` (Node/ESM target, not the browser build) — a small HTTP server the host spawns and proxies to on `127.0.0.1`. Every request is bearer-authenticated by the host itself; the panel never sees the token or dials the port directly.
+- `src/service/main.ts` and `src/service/server.ts`, built to `service/main.js` (Node/ESM target, not the browser build) — a small HTTP server the host spawns and proxies to on `127.0.0.1`. Every request is bearer-authenticated by the host itself; the panel never sees the token or dials the port directly.
 - Runs **exactly one command**: `git -C <directory> for-each-ref --sort=-committerdate --count=200 --format=%(refname) refs/heads refs/remotes` — read-only, most-recently-active branches first, capped at 200, for a project directory the panel already knows about (`path.isAbsolute` checked).
 - `src/host/branchService.ts` (`fetchServiceBranches`) is best-effort: not approved, not running, a bad answer, or any other error all become `null`, never an exception the UI has to handle, because the worktree-derived fallback is a complete, working option on its own.
 

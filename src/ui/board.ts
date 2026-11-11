@@ -13,8 +13,9 @@ import { createWorktreeSync } from '../host/worktreeSync.ts';
 import { watchOrphanSessions } from '../host/orphanSessions.ts';
 import { DEFAULT_SYNC_OPTIONS } from '../domain/sync.ts';
 import { sessionLinkState, worktreeLinkState, type SessionGoneReason, type SessionsView, type WorktreesView } from '../domain/unlink.ts';
-import { sessionTitleForTask, titleForOrphanSession } from '../domain/autoTask.ts';
+import { selectSessionsToImport, sessionTitleForTask, titleForOrphanSession } from '../domain/autoTask.ts';
 import { buildBaseBranchOptions, describeWorktreeOption, hasKnownBranches, resolveTaskWorktree } from '../domain/worktree.ts';
+import { mountHarnessFeed } from './harness.ts';
 import { mountTaskDetail } from './detail.ts';
 import { injectStyles } from './styles.ts';
 import { insertionTarget } from './dnd.ts';
@@ -84,8 +85,39 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     },
   });
 
+  const importSessions = mountButton(addRow, {
+    label: 'Import running sessions',
+    disabled: true,
+    variant: 'secondary',
+    onClick: () => {
+      if (importing || reloading || !boardLoaded || !projectsReady) return;
+      importing = true;
+      void (async () => {
+        importSessions.update({ loading: true });
+        refresh.update({ disabled: true });
+        try {
+          for (const project of projects) {
+            const result = await fetchSessions(host, project.id);
+            if (disposed) return;
+            if (!result.complete) throw new Error('Session import was incomplete. Refresh and try again.');
+            const excluded = new Set([...excludedSessionIds(), ...attemptedSessions]);
+            for (const { session, status } of selectSessionsToImport(result.sessions, excluded)) {
+              await adoptRunningSession(project.id, session, status, true);
+            }
+          }
+        } catch (error) { notify(error); }
+        finally {
+          importing = false;
+          importSessions.update({ loading: false });
+          refresh.update({ disabled: false });
+        }
+      })();
+    },
+  });
+
   const columnsRoot = el('div', 'kb-columns'); page.append(columnsRoot);
   const spinnerSlot = el('div'); page.append(spinnerSlot);
+  const harness = mountHarnessFeed(host, page);
 
   let tasks: Task[] = [];
   let projects: GuestProject[] = [];
@@ -94,6 +126,12 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
   let detail: { dispose: () => void } | null = null;
   let draggingId: string | null = null;
   let disposed = false;
+  let importing = false;
+  let reloading = false;
+  let boardLoaded = false;
+  let projectsReady = false;
+  const pendingAdoptions = new Set<Promise<void>>();
+  const updateImportAvailability = () => importSessions.update({ disabled: reloading || !boardLoaded || !projectsReady });
 
   /** The one place `tasks` changes, so the session/worktree watchers always see the current set. */
   const setTasks = (next: Task[]) => {
@@ -253,11 +291,11 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
    * it already finished). Sessions older than the watermark (pre-dating
    * this feature's first use) are left alone, by design.
    */
-  const adoptRunningSession = (projectId: string, session: { id: string; title: string; createdAt: number }, status: TaskStatus) => {
-    if (disposed || startingAgents > 0 || attemptedSessions.has(session.id) || excludedSessionIds().has(session.id)) return;
-    if (session.createdAt < orphanWatermark) return;
+  const adoptRunningSession = (projectId: string, session: { id: string; title: string; createdAt: number }, status: TaskStatus, explicit = false) => {
+    if (disposed || reloading || startingAgents > 0 || attemptedSessions.has(session.id) || excludedSessionIds().has(session.id)) return;
+    if (!explicit && session.createdAt < orphanWatermark) return;
     attemptedSessions.add(session.id);
-    void (async () => {
+    const adoption = (async () => {
       try {
         const task: Task = {
           ...createTask({ title: titleForOrphanSession(session, projects.find((p) => p.id === projectId)?.name ?? null), projectId, status }, rankAtEnd(tasks, status)),
@@ -271,6 +309,9 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
         void host.toast({ kind: 'info', message: `Added "${task.title}" to the board (${STATUS_LABELS[status]}) — found a session running with no task.` }).catch(() => undefined);
       } catch (error) { notify(error); }
     })();
+    pendingAdoptions.add(adoption);
+    void adoption.finally(() => pendingAdoptions.delete(adoption));
+    return adoption;
   };
   let orphanWatcher: { dispose: () => void } | null = null;
 
@@ -688,8 +729,12 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
   };
 
   const reload = async () => {
+    if (importing || reloading) return;
+    reloading = true;
+    importSessions.update({ disabled: true });
     refresh.update({ loading: true });
     try {
+      await Promise.all(pendingAdoptions);
       const [{ tasks: loaded, failedKeys }, loadedPrefs, watermark, dismissed] = await Promise.all([
         loadTasks(host), loadPrefs(host), loadOrphanWatermark(host), loadDismissedSessions(host),
       ]);
@@ -716,14 +761,21 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
       // are cleared before the orphan watcher starts, so a session whose link
       // is about to be dropped can never also be re-adopted as a duplicate.
       await reconcileLinks();
+      boardLoaded = true;
       if (prefs.openTaskId && tasks.some((t) => t.id === prefs.openTaskId)) openDetail(prefs.openTaskId);
     } catch (error) { notify(error); }
-    finally { refresh.update({ loading: false }); }
+    finally {
+      reloading = false;
+      refresh.update({ loading: false });
+      updateImportAvailability();
+    }
   };
 
   let stopProjects: (() => void) | null = null;
   void watchProjects(host, (state) => {
     if (disposed) return;
+    projectsReady = state.state === 'ready';
+    updateImportAvailability();
     if (state.state === 'error') { showBanner('Projects unavailable', 'Showing tasks without live project data.', 'warning'); return; }
     projects = state.projects;
     projectSelect.update({ options: projectOptions() });
@@ -740,6 +792,7 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
   return {
     dispose: () => {
       disposed = true;
+      harness.dispose();
       stopProjects?.();
       sessionSync.dispose();
       worktreeSync.dispose();
