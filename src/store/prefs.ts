@@ -41,9 +41,11 @@ export const parsePrefs = (value: unknown): Prefs => {
   };
 };
 
-export const tagKey = (id: string) => `tag:${id}`;
+export const tagKey = (id: string, generation = 1) => `tag${generation === 1 ? '' : generation}:${id}`;
+export type TagVersion = { rev: number; generation?: number };
+export const newerTag = (a: TagVersion, b: TagVersion) => (a.generation ?? 1) > (b.generation ?? 1) || ((a.generation ?? 1) === (b.generation ?? 1) && a.rev > b.rev);
 export const TAG_MIGRATION_KEY = 'tagMigration';
-type TagRecord = { value: ProjectTag | undefined; rev: number };
+export type TagRecord = TagVersion & { value: ProjectTag | undefined };
 const parseTagRecord = (raw: unknown): TagRecord => {
   const record = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : { value: raw };
   return {
@@ -52,26 +54,45 @@ const parseTagRecord = (raw: unknown): TagRecord => {
   };
 };
 
-export const loadProjectTag = async (host: Storage, id: string) => parseTagRecord(await host.storage.get(tagKey(id)));
-
-/** Personal always writes; Work and cleanup compare revisions captured before queue delays. */
-export const saveProjectTag = async (host: Storage, id: string, tag: ProjectTag | null, expected: number | null) => {
-  const raw = await host.storage.get(tagKey(id));
-  const stored = parseTagRecord(raw);
-  // null expects an absent key for migration, including no malformed/legacy value.
-  const matches = expected === null ? raw == null : stored.rev === expected;
-  if ((expected === null || tag !== 'personal') && (!matches || stored.rev === Number.MAX_SAFE_INTEGER)) {
-    return { tag: stored.value, rev: stored.rev, conflict: true };
-  }
-  const rev = Math.min(stored.rev + 1, Number.MAX_SAFE_INTEGER);
-  await host.storage.set(tagKey(id), { value: tag, rev });
-  return { tag: tag ?? undefined, rev, conflict: false };
+const tagKeys = async (host: Storage) => (await host.storage.keys()).flatMap(key => {
+  const match = /^tag(\d*):(.*)$/.exec(key);
+  const generation = match?.[1] ? Number(match[1]) : 1;
+  return match && Number.isSafeInteger(generation) && generation >= 1 ? [{ id: match[2]!, generation }] : [];
+});
+export const loadProjectTag = async (host: Storage, id: string): Promise<TagRecord> => {
+  const generation = (await tagKeys(host)).filter(key => key.id === id).reduce((max, key) => Math.max(max, key.generation), 1);
+  const record = parseTagRecord(await host.storage.get(tagKey(id, generation)));
+  return generation === 1 ? record : { ...record, generation };
 };
 
+/** Personal always writes; Work and cleanup compare versions captured before queue delays. */
+export const saveProjectTag = async (host: Storage, id: string, tag: ProjectTag | null, expected: number | TagVersion | null, reset = false) => {
+  const stored = await loadProjectTag(host, id);
+  const generation = stored.generation ?? 1;
+  // null expects an absent key for migration, including no malformed/legacy value.
+  const matches = expected === null ? generation === 1 && await host.storage.get(tagKey(id)) == null
+    : !newerTag(stored, typeof expected === 'number' ? { rev: expected } : expected)
+      && !newerTag(typeof expected === 'number' ? { rev: expected } : expected, stored);
+  if (reset) {
+    if (!matches || stored.rev !== Number.MAX_SAFE_INTEGER) return { ...stored, tag: stored.value, conflict: true };
+    await host.storage.set(tagKey(id, generation + 1), { value: 'personal', rev: 0 });
+    return { tag: 'personal' as const, rev: 0, generation: generation + 1, conflict: false };
+  }
+  if ((expected === null || tag !== 'personal') && (!matches || stored.rev === Number.MAX_SAFE_INTEGER)) {
+    return { ...stored, tag: stored.value, conflict: true };
+  }
+  const rev = Math.min(stored.rev + 1, Number.MAX_SAFE_INTEGER);
+  await host.storage.set(tagKey(id, generation), { value: tag, rev });
+  return { tag: tag ?? undefined, rev, generation, conflict: false };
+};
+
+export const loadProjectTagRecords = async (host: Storage, ids?: readonly string[]): Promise<Record<string, TagRecord>> => {
+  const projectIds = ids ?? [...new Set((await tagKeys(host)).map(key => key.id))];
+  return Object.fromEntries(await Promise.all(projectIds.map(async id => [id, await loadProjectTag(host, id)])));
+};
 export const loadProjectTags = async (host: Storage, ids?: readonly string[]): Promise<Record<string, ProjectTag>> => {
-  const projectIds = ids ?? (await host.storage.keys()).filter(key => key.startsWith('tag:')).map(key => key.slice(4));
-  const entries = await Promise.all(projectIds.map(async id => [id, (await loadProjectTag(host, id)).value] as const));
-  return Object.fromEntries(entries.filter((entry): entry is readonly [string, ProjectTag] => entry[1] !== undefined));
+  const records = await loadProjectTagRecords(host, ids);
+  return Object.fromEntries(Object.entries(records).flatMap(([id, record]) => record.value === undefined ? [] : [[id, record.value]]));
 };
 
 /** Explicit startup migration; ordinary preference and tag reads never write. */
@@ -89,9 +110,9 @@ export const migratePrefs = async (host: Storage): Promise<void> => {
   await host.storage.set(TAG_MIGRATION_KEY, true);
 };
 
-export const loadPrefs = async (host: Storage): Promise<Prefs> => {
+export const loadPrefs = async (host: Storage, records?: Record<string, TagRecord>): Promise<Prefs> => {
   const prefs = parsePrefs(await host.storage.get(PREFS_KEY));
-  return { ...prefs, projectTags: await loadProjectTags(host) };
+  return { ...prefs, projectTags: records ? Object.fromEntries(Object.entries(records).flatMap(([id, record]) => record.value === undefined ? [] : [[id, record.value]])) : await loadProjectTags(host) };
 };
 
 export const savePrefs = (host: Storage, prefs: Prefs) =>

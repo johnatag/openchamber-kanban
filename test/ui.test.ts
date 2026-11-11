@@ -39,7 +39,7 @@ const setup = () => {
   const root = new DomNode('root');
   return { root, doc, win, element: root as unknown as Element };
 };
-const settle = async () => { for (let i = 0; i < 30; i += 1) await Promise.resolve(); };
+const settle = async () => { for (let i = 0; i < 100; i += 1) await Promise.resolve(); };
 const deferred = <T>() => { let resolve!: (value: T) => void; const promise = new Promise<T>((done) => { resolve = done; }); return { promise, resolve }; };
 const session = (id: string) => ({ id, title: id, directory: '/project', createdAt: 1, updatedAt: 1, parentId: null, archivedAt: null, activity: 'running', outcome: null });
 const fakeHost = () => {

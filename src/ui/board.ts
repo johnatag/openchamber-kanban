@@ -3,7 +3,7 @@ import { mountBanner, mountButton, mountSearchField, mountSelect, mountSpinner }
 import { applyPatch, createTask, DEFAULT_TASK_TITLE, STATUSES, STATUS_LABELS, type Task, type TaskPatch, type TaskStatus } from '../domain/task.ts';
 import { ALL_PROJECTS, NO_PROJECT, groupColumns, planDrop, rankAtEnd, type BoardFilter } from '../domain/board.ts';
 import { deleteTask, loadTasks, saveTask } from '../store/taskStore.ts';
-import { DEFAULT_PREFS, loadProjectTags, type Prefs } from '../store/prefs.ts';
+import { DEFAULT_PREFS, loadProjectTagRecords, type Prefs } from '../store/prefs.ts';
 import { createPrefsStore } from '../store/prefsStore.ts';
 import { loadOrphanWatermark, saveOrphanWatermark } from '../store/orphanWatermark.ts';
 import { loadDismissedSessions, saveDismissedSessions } from '../store/dismissedSessions.ts';
@@ -63,6 +63,17 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     const option = el('option', '', label); option.value = value!; projectTag.append(option);
   }
   toolbar.append(projectTag);
+  let corruptProjectId: string | undefined;
+  const corruptTag = el('span', '', "This project's saved type is corrupt; ");
+  const resetTag = el('button', '', 'Reset'); resetTag.type = 'button';
+  corruptTag.append(resetTag); corruptTag.hidden = true; toolbar.append(corruptTag);
+  resetTag.addEventListener('click', () => {
+    const id = corruptProjectId;
+    if (!id) return;
+    resetTag.disabled = true;
+    void prefsStore.resetTag(id).then(() => { corruptProjectId = undefined; render(); }, notify)
+      .finally(() => { resetTag.disabled = false; });
+  });
   const searchWrap = el('div', 'grow'); toolbar.append(searchWrap);
   // Remains clickable while work is pending: reload coalesces follow-up requests.
   mountButton(toolbar, { label: 'Refresh', variant: 'ghost', onClick: () => { void reload(); } });
@@ -158,7 +169,11 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
       cockpit.setPrefs(prefs, projectsReady && hasCockpitScope({ projects, projectId: filter.projectId, projectTags: prefs.projectTags }));
       render();
     }
-  }, () => { if (!disposed) void host.toast({ kind: 'info', message: 'Changed elsewhere, choose again' }).catch(notify); });
+  }, (id, corrupt) => {
+    if (disposed) return;
+    if (corrupt) { corruptProjectId = id; render(); }
+    else void host.toast({ kind: 'info', message: 'Changed elsewhere, choose again' }).catch(notify);
+  });
   const patchPrefs = prefsStore.patch;
   let missingTags = new Map<string, number>();
   const pruneProjectTags = () => {
@@ -659,6 +674,7 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     const scope = { projects, projectId: filter.projectId, projectTags: prefs.projectTags };
     projectTag.hidden = !projects.some(project => project.id === filter.projectId);
     projectTag.value = prefs.projectTags[filter.projectId] ?? 'personal';
+    corruptTag.hidden = corruptProjectId !== filter.projectId;
     harness.setScope(scope);
     const cockpitAvailable = hasCockpitScope(scope);
     tabs.setAvailable('cockpit', cockpitAvailable && cockpitHasContent);
@@ -852,11 +868,11 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
   }, async () => {
     const scopeId = filter.projectId;
     const scopeProjects = scopeId === ALL_PROJECTS ? projects : projects.filter(project => project.id === scopeId);
-    const storedTags = await loadProjectTags(host, scopeProjects.map(project => project.id));
+    const storedTags = await loadProjectTagRecords(host, scopeProjects.map(project => project.id));
     if (disposed || !projectsReady || scopeId !== filter.projectId) return false;
-    prefsStore.adoptPersonal(Object.fromEntries(scopeProjects.filter(project => storedTags[project.id] !== 'work').map(project => [project.id, storedTags[project.id] ?? null])));
+    prefsStore.adoptPersonal(Object.fromEntries(Object.entries(storedTags).filter(([, record]) => record.value !== 'work')));
     // A project must be Work in both views; a pending Personal intent always wins.
-    const tags = Object.fromEntries(projects.filter(project => prefs.projectTags[project.id] === 'work' && storedTags[project.id] === 'work').map(project => [project.id, 'work' as const]));
+    const tags = Object.fromEntries(projects.filter(project => prefs.projectTags[project.id] === 'work' && storedTags[project.id]?.value === 'work').map(project => [project.id, 'work' as const]));
     return hasCockpitScope({ projects, projectId: scopeId, projectTags: tags });
   });
 

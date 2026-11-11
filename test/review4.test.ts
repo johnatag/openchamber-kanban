@@ -36,7 +36,7 @@ const setup = () => {
   const root = new DomNode('root');
   return { root, doc, win, element: root as unknown as Element };
 };
-const settle = async () => { for (let i = 0; i < 30; i += 1) await Promise.resolve(); };
+const settle = async () => { for (let i = 0; i < 100; i += 1) await Promise.resolve(); };
 const deferred = <T>() => { let resolve!: (value: T) => void; const promise = new Promise<T>((done) => { resolve = done; }); return { promise, resolve }; };
 const session = (id: string) => ({ id, title: id, directory: '/project', createdAt: 1, updatedAt: 1, parentId: null, archivedAt: null, activity: 'running', outcome: null });
 const fakeHost = () => {
@@ -193,7 +193,8 @@ test('R7 remount after rev-MAX Personal', async (t) => {
   assert.equal(tagSel(c.root).value, 'personal'); assert.equal(polls.n, p1);
   const choice = tagSel(c.root); choice.value = 'work'; choice.dispatchEvent(new Event('change')); await settle(); await settle();
   assert.equal(choice.value, 'personal'); assert.equal(polls.n, p1);
-  assert.ok(fake.toasts.includes('Changed elsewhere, choose again'));
+  assert.ok(c.root.textContent.includes("This project's saved type is corrupt;"));
+  assert.ok(!fake.toasts.includes('Changed elsewhere, choose again'));
   b2.dispose();
 });
 test('R7 stuck Personal in A, later Work in B, A drains', async (t) => {
@@ -242,4 +243,54 @@ test('R7 legacy {value,at} strip races a Personal from the other window', async 
   hold.resolve(); await settle(); await settle();
   assert.deepEqual(fake.stored.get('tag:p'), { value: 'personal', rev: 1 });
   pa.dispose();
+});
+
+test('R8 gate read races a fresh Work click in the same window', async (t) => {
+  const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] }); const polls = { n: 0 };
+  fake.stored.set('prefs', { projectId: 'p', cockpitEmail: 'me@example.com' }); fake.stored.set('tagMigration', true); fake.stored.set('tag:p', { value: 'work', rev: 1 });
+  fake.host.serviceRequest = ok(polls) as any;
+  const A = viewHost(fake);
+  const get = A.host.storage.get; let holdNext = false; const hold = deferred<void>();
+  A.host.storage.get = async (k: string) => { const v = await get(k); if (holdNext && k === 'tag:p') { holdNext = false; await hold.promise; } return v; };
+  const a = setup(); const pa = mountKanbanBoard(A.host, a.element); await settle();
+  const tag = tagSel(a.root);
+  // other window makes it Personal
+  fake.stored.set('tag:p', { value: 'personal', rev: 2 });
+  holdNext = true; t.mock.timers.tick(60000); await settle(); // gate read of tag:p returns Personal but is held
+  // meanwhile this window: user sees Work (stale) -> picks Personal then Work? It shows Work; simulate a fresh Work after a manual Personal
+  tag.value = 'personal'; tag.dispatchEvent(new Event('change')); await settle(); await settle();
+  tag.value = 'work'; tag.dispatchEvent(new Event('change')); await settle(); await settle();
+  assert.deepEqual(fake.stored.get('tag:p'), { value: 'work', rev: 4 });
+  assert.equal(tag.value, 'work');
+  hold.resolve(); await settle(); await settle();
+  const p1 = polls.n; t.mock.timers.tick(60000); await settle(); await settle();
+  assert.equal(tag.value, 'work');
+  assert.deepEqual(fake.toasts, []);
+  assert.equal(polls.n - p1, 1);
+  pa.dispose();
+});
+
+
+test('corrupt saved type offers Reset and an old-key window adopts its safe Personal generation', async (t) => {
+  const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] }); const polls = { n: 0 };
+  fake.stored.set('prefs', { projectId: 'p', cockpitEmail: 'me@example.com' }); fake.stored.set('tagMigration', true);
+  fake.stored.set('tag:p', { value: 'work', rev: Number.MAX_SAFE_INTEGER });
+  fake.host.serviceRequest = ok(polls) as any;
+  const a = setup(); const pa = mountKanbanBoard(viewHost(fake).host, a.element); await settle();
+  const b = setup(); const pb = mountKanbanBoard(viewHost(fake).host, b.element); await settle();
+  const tag = tagSel(a.root); tag.value = 'work'; tag.dispatchEvent(new Event('change')); await settle();
+  assert.ok(a.root.textContent.includes("This project's saved type is corrupt;"));
+  assert.ok(!fake.toasts.includes('Changed elsewhere, choose again'));
+  click(a.root, 'Reset'); await settle();
+  assert.deepEqual(fake.stored.get('tag2:p'), { value: 'personal', rev: 0 });
+  assert.equal(tag.value, 'personal');
+  const before = polls.n; t.mock.timers.tick(60000); await settle();
+  assert.equal(tagSel(b.root).value, 'personal'); assert.equal(polls.n, before);
+  // A late old-generation record cannot beat the reset.
+  fake.stored.set('tag:p', { value: 'work', rev: Number.MAX_SAFE_INTEGER });
+  click(b.root, 'Refresh'); await settle(); assert.equal(tagSel(b.root).value, 'personal');
+  tag.value = 'work'; tag.dispatchEvent(new Event('change')); await settle();
+  assert.deepEqual(fake.stored.get('tag2:p'), { value: 'work', rev: 1 });
+  assert.equal(tag.value, 'work');
+  pa.dispose(); pb.dispose();
 });

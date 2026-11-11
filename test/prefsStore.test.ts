@@ -230,3 +230,47 @@ test('migration expects absence, so revision-zero legacy or malformed keys also 
   assert.deepEqual(f.stored.get('tag:new'), { value: 'work', rev: 1 });
   assert.equal(f.stored.get('tagMigration'), true);
 });
+
+test('poll adoption requires a strictly newer version than the last saved or adopted tag', async () => {
+  const f = fixture(); f.loading.resolve(); f.stored.set('tag:p', { value: 'work', rev: 4 });
+  let conflicts = 0; const store = createPrefsStore(f.host, () => {}, () => { conflicts++; }); await store.load();
+  for (const rev of [3, 4]) store.adoptPersonal({ p: { value: 'personal', rev } });
+  assert.equal(store.view().projectTags.p, 'work'); assert.equal(conflicts, 0);
+  store.adoptPersonal({ p: { value: 'personal', rev: 5 } });
+  assert.equal(store.view().projectTags.p, 'personal'); assert.equal(conflicts, 1);
+  store.adoptPersonal({ p: { value: 'personal', rev: 5 } }); assert.equal(conflicts, 1);
+  f.stored.set('tag:p', { value: 'work', rev: 6 }); await store.reload();
+  store.adoptPersonal({ p: { value: 'personal', rev: 5 } });
+  assert.equal(store.view().projectTags.p, 'work'); assert.equal(conflicts, 1);
+});
+
+test('reset advances generations, refuses queued old-generation Work, and allows fresh Work', async () => {
+  const f = fixture(); f.loading.resolve(); f.stored.set('tag:p', { value: 'personal', rev: Number.MAX_SAFE_INTEGER });
+  const a = createPrefsStore(f.host); const b = createPrefsStore(f.host); await Promise.all([a.load(), b.load()]);
+  const blocked = a.patch({ query: 'block queue' }); await settle();
+  const staleWork = a.patch({ projectTags: { p: 'work' } }); await settle();
+  const reset = b.resetTag('p'); await settle();
+  f.writes.find(write => write.key === 'tag2:p')!.gate.resolve(); await reset;
+  assert.deepEqual(f.stored.get('tag2:p'), { value: 'personal', rev: 0 });
+  await f.flush(); await Promise.all([blocked, staleWork]);
+  assert.equal(a.view().projectTags.p, 'personal');
+  assert.deepEqual(f.stored.get('tag2:p'), { value: 'personal', rev: 0 });
+  const work = a.patch({ projectTags: { p: 'work' } }); await f.flush(); await work;
+  assert.deepEqual(f.stored.get('tag2:p'), { value: 'work', rev: 1 }); assert.equal(a.view().projectTags.p, 'work');
+  // A second exhausted generation can also be recovered.
+  f.stored.set('tag2:p', { value: 'work', rev: Number.MAX_SAFE_INTEGER });
+  const resetAgain = b.resetTag('p'); await f.flush(); await resetAgain;
+  assert.deepEqual(f.stored.get('tag3:p'), { value: 'personal', rev: 0 });
+  await a.reload(); assert.equal(a.view().projectTags.p, 'personal');
+});
+
+test('failed reset surfaces storage failure, stays Personal locally, and can be retried', async () => {
+  const f = fixture(); f.loading.resolve(); f.stored.set('tag:p', { value: 'work', rev: Number.MAX_SAFE_INTEGER });
+  const store = createPrefsStore(f.host); await store.load();
+  const reset = store.resetTag('p'); const rejected = assert.rejects(reset, /offline/); await settle();
+  const write = f.writes.find(write => write.key === 'tag2:p')!; write.fail = true; write.gate.resolve(); await rejected;
+  assert.equal(store.view().projectTags.p, 'personal'); assert.equal(f.stored.has('tag2:p'), false);
+  const retry = store.resetTag('p'); await f.flush(); await retry;
+  assert.deepEqual(f.stored.get('tag2:p'), { value: 'personal', rev: 0 });
+  assert.equal((await loadPrefs(f.host)).projectTags.p, 'personal');
+});

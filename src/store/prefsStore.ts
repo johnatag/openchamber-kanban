@@ -1,4 +1,4 @@
-import { DEFAULT_PREFS, loadPrefs, migratePrefs, loadProjectTag, savePrefs, saveProjectTag, type Prefs, type ProjectTag } from './prefs.ts';
+import { DEFAULT_PREFS, loadPrefs, migratePrefs, loadProjectTag, savePrefs, saveProjectTag, type Prefs, type ProjectTag, type TagRecord, type TagVersion, loadProjectTagRecords, newerTag } from './prefs.ts';
 
 type Host = Parameters<typeof loadPrefs>[0];
 export type PrefsPatch = Partial<Omit<Prefs, 'projectTags'>> & { projectTags?: Record<string, ProjectTag | null> };
@@ -11,20 +11,27 @@ const apply = (prefs: Prefs, patch: PrefsPatch): Prefs => {
 };
 
 /** Saved storage plus ordered field patches. Failed Personal intents remain for the next write. */
-export const createPrefsStore = (host: Host, changed: (prefs: Prefs) => void = () => {}, onConflict: () => void = () => {}) => {
-  const personalRevisions = new Map<string, number>();
+export const createPrefsStore = (host: Host, changed: (prefs: Prefs) => void = () => {}, onConflict: (id?: string, corrupt?: boolean) => void = () => {}) => {
+  const personalRevisions = new Map<string, TagVersion>();
+  const confirmed = new Map<string, TagVersion>();
+  const confirm = (records: Record<string, TagVersion>) => {
+    for (const [id, record] of Object.entries(records)) {
+      if (newerTag(record, confirmed.get(id) ?? { rev: -1 })) confirmed.set(id, record);
+    }
+  };
   const readPrefs = async () => {
-    const value = await loadPrefs(host);
+    const records = await loadProjectTagRecords(host);
+    const value = await loadPrefs(host, records);
     for (const [id, rev] of personalRevisions) {
       if (value.projectTags[id] === 'work') {
         const stored = await loadProjectTag(host, id);
-        if (stored.value !== 'work' || stored.rev <= rev) value.projectTags[id] = 'personal';
+        if (stored.value !== 'work' || !newerTag(stored, rev)) value.projectTags[id] = 'personal';
       }
     }
-    return value;
+    return { value, records };
   };
   let saved: Prefs = { ...DEFAULT_PREFS };
-  let pending: { patch: PrefsPatch; expected: Promise<Map<string, number>> }[] = [];
+  let pending: { patch: PrefsPatch; expected: Promise<Map<string, TagVersion>>; resetId?: string }[] = [];
   let loading: Promise<void> | null = null;
   let loaded = false;
   let revision = 0;
@@ -36,16 +43,16 @@ export const createPrefsStore = (host: Host, changed: (prefs: Prefs) => void = (
   const publish = () => changed(view());
   const load = (): Promise<void> => {
     if (loaded) return Promise.resolve();
-    if (!loading) loading = migratePrefs(host).then(readPrefs).then(value => { saved = value; loaded = true; publish(); }).finally(() => { loading = null; });
+    if (!loading) loading = migratePrefs(host).then(readPrefs).then(({ value, records }) => { saved = value; confirm(records); loaded = true; publish(); }).finally(() => { loading = null; });
     return loading;
   };
-  const patch = (patch: PrefsPatch): Promise<void> => {
+  const patch = (patch: PrefsPatch, resetId?: string): Promise<void> => {
     // Copy the writer's fields so later mutations cannot alter an in-flight write.
     const copy = structuredClone(patch);
     // Start reads at the user's action, outside the serialized write queue.
-    const expected = Promise.all(Object.entries(copy.projectTags ?? {}).filter(([, tag]) => tag !== 'personal')
-      .map(async ([id]) => [id, (await loadProjectTag(host, id)).rev] as const)).then(values => new Map(values));
-    const entry = { patch: copy, expected };
+    const expected = Promise.all(Object.entries(copy.projectTags ?? {}).filter(([, tag]) => tag !== 'personal' || resetId !== undefined)
+      .map(async ([id]) => [id, await loadProjectTag(host, id)] as const)).then(values => new Map(values));
+    const entry = { patch: copy, expected, resetId };
     // The queued writer surfaces read failures; handle early rejection until it runs.
     void entry.expected.catch(() => {});
     revision++;
@@ -55,25 +62,28 @@ export const createPrefsStore = (host: Host, changed: (prefs: Prefs) => void = (
         await load();
         const end = pending.indexOf(entry);
         const patches = pending.slice(0, end + 1);
-        const value = patches.reduce((prefs, entry) => apply(prefs, entry.patch), await readPrefs());
+        const snapshot = await readPrefs();
+        const value = patches.reduce((prefs, entry) => apply(prefs, entry.patch), snapshot.value);
         // Only fields this instance actually changed can be written.
-        const tagChanges = new Map<string, { tag: ProjectTag | null; expected: number }>();
+        const tagChanges = new Map<string, { tag: ProjectTag | null; expected: TagVersion; reset: boolean }>();
         for (const entry of patches) {
           const expected = await entry.expected;
-          for (const [id, tag] of Object.entries(entry.patch.projectTags ?? {})) tagChanges.set(id, { tag, expected: expected.get(id) ?? 0 });
+          for (const [id, tag] of Object.entries(entry.patch.projectTags ?? {})) tagChanges.set(id, { tag, expected: expected.get(id) ?? { rev: 0 }, reset: entry.resetId === id });
         }
-        let conflict = false;
-        for (const [id, { tag, expected }] of tagChanges) {
-          const result = await saveProjectTag(host, id, tag, expected);
-          if (tag === 'personal' && !result.conflict) personalRevisions.set(id, result.rev);
-          if (result.tag === 'work' && result.rev <= (personalRevisions.get(id) ?? -1)) result.tag = 'personal';
+        let conflict: { id: string; corrupt: boolean } | undefined;
+        for (const [id, { tag, expected, reset }] of tagChanges) {
+          const result = await saveProjectTag(host, id, tag, expected, reset);
+          snapshot.records[id] = { ...result, value: result.tag };
+          if (tag === 'personal' && !result.conflict) personalRevisions.set(id, result);
+          if (result.tag === 'work' && personalRevisions.has(id) && !newerTag(result, personalRevisions.get(id)!)) result.tag = 'personal';
           if (result.tag === undefined) delete value.projectTags[id]; else value.projectTags[id] = result.tag;
-          conflict ||= result.conflict && tag === 'work';
+          if (result.conflict && (tag === 'work' || reset)) conflict = { id, corrupt: result.rev === Number.MAX_SAFE_INTEGER };
         }
         if (patches.some(({ patch }) => Object.keys(patch).some(key => key !== 'projectTags'))) await savePrefs(host, value);
         saved = value;
+        confirm(snapshot.records);
         pending.splice(0, end + 1);
-        if (conflict) onConflict();
+        if (conflict) onConflict(conflict.id, conflict.corrupt);
       } catch (error) {
         const index = pending.indexOf(entry);
         // Drop only this writer; retain just its fail-safe Personal intent.
@@ -90,16 +100,18 @@ export const createPrefsStore = (host: Host, changed: (prefs: Prefs) => void = (
     await queue;
     if (!loaded) return load();
     const started = revision;
-    const value = await readPrefs();
-    if (started === revision) { saved = value; publish(); }
+    const { value, records } = await readPrefs();
+    if (started === revision) { saved = value; confirm(records); publish(); }
   };
-  const adoptPersonal = (tags: Record<string, ProjectTag | null>) => {
-    const updates = Object.fromEntries(Object.entries(tags).filter(([id, tag]) => tag !== 'work' && view().projectTags[id] === 'work'));
+  const adoptPersonal = (tags: Record<string, TagRecord>) => {
+    const updates = Object.fromEntries(Object.entries(tags).filter(([id, record]) => record.value !== 'work'
+      && view().projectTags[id] === 'work' && newerTag(record, confirmed.get(id) ?? { rev: -1 }))
+      .map(([id, record]) => { confirmed.set(id, record); return [id, record.value ?? null]; }));
     if (!Object.keys(updates).length) return;
     revision++;
     saved = apply(saved, { projectTags: updates });
     publish();
     onConflict();
   };
-  return { load, reload, patch, view, adoptPersonal, idle: () => queue };
+  return { load, reload, patch, view, adoptPersonal, resetTag: (id: string) => patch({ projectTags: { [id]: 'personal' } }, id), idle: () => queue };
 };
