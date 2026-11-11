@@ -58,12 +58,13 @@ export const sessionTitleForTask = (task: Pick<Task, 'title' | 'description'>): 
   return title || DEFAULT_TASK_TITLE;
 };
 
-/** Explicit import shares adoption rules but deliberately has no watermark. */
+/** Explicit import takes only currently active sessions, regardless of age. */
 export const selectSessionsToImport = <T extends OrphanCandidate>(sessions: readonly T[], excludedIds: ReadonlySet<string>) => {
   const claimed = new Set(excludedIds);
   const selected: { session: T; status: TaskStatus }[] = [];
   for (const session of sessions) {
     if (!isAdoptable(session, claimed)) continue;
+    if (!['running', 'retrying', 'waiting-question', 'waiting-permission'].includes(session.activity)) continue;
     const status = initialStatusForNewSession(session);
     if (!status) continue;
     claimed.add(session.id);

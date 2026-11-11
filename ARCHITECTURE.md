@@ -1,6 +1,6 @@
 # Architecture
 
-A local-first Kanban board extension for OpenChamber, built with the official `@openchamber/sdk`. All task and preference data lives in `host.storage` on the connected OpenChamber server — nothing is sent anywhere else, and no capability beyond what's listed below is used.
+A local-first Kanban board extension for OpenChamber, built with the official `@openchamber/sdk`. All task and preference data lives in `host.storage` on the connected OpenChamber server — the optional Cockpit integration reads remote task metadata through the service, and no capability beyond what's listed below is used.
 
 Requires OpenChamber `>=1.24.0` — the Extensions SDK (`Settings → Extensions`, panels, pages, `host.storage`) doesn't exist in earlier versions.
 
@@ -25,7 +25,7 @@ Requires OpenChamber `>=1.24.0` — the Extensions SDK (`Settings → Extensions
 |---|---|
 | `sessions` | `listProjects`/`onProjects`, `listSessions`/`onSessions`, `listWorktrees`/`onWorktrees`, `startSession`, `openSession` — reading project/session/worktree state and creating or opening sessions. |
 | `prompt` | Permits `startSession` to send its `text` field as the agent's first message. The returned `sent` value is checked because session creation can succeed without the message being delivered. |
-| `service` (auto-added by declaring `contributes.service`) | The local branch and harness-feed service, see below. |
+| `service` (auto-added by declaring `contributes.service`) | The local branch, harness-feed, and Cockpit service, see below. |
 
 **Capability approval is all-or-nothing.** The host's own grant endpoint (`PUT /api/guests/:id/capabilities`) accepts only the full requested list or `[]` — there is no partial grant. Installing this extension means accepting all three capabilities together; there is no way to get the Kanban board without also being asked about the local service.
 
@@ -42,6 +42,7 @@ openchamber-kanban/
       worktree.ts         # worktree/branch picker logic, local service response parsing — pure
       unlink.ts            # link health: whether a linked session/worktree provably still exists — pure
       autoTask.ts          # orphan-session eligibility + explicit import selection + initial status + title — pure
+      cockpit.ts           # slim records, filters, exact-key linking — pure
       harness.ts           # JSONL record parsing, status mapping and newest-200 selection — pure
     store/
       taskStore.ts      # one host.storage key per task: task:<id>
@@ -53,19 +54,22 @@ openchamber-kanban/
       worktreeSync.ts       # live onWorktrees watcher → worktree-deleted unlinks
       orphanSessions.ts     # live onProjects+onSessions watcher → sessions with no task yet
       branchService.ts        # calls the local git-branch service; null on any failure
+      cockpitService.ts       # fixed Cockpit route + validated slim response
       harnessService.ts       # fixed harness route + validated service response
     ui/
       dnd.ts            # drop-target math — pure, no DOM
       styles.ts           # CSS using the host's --oc-* theme tokens
       dom.ts                # element() helper
       board.ts               # the Kanban board
+      cockpit.ts             # read-only Cockpit section + visibility-scoped polling
       harness.ts             # read-only activity section + visibility-scoped polling
       detail.ts                # task detail dialog
     page.ts             # full-screen page entry (contributes.page)
     panel.ts              # rail panel entry: summary + badge
     service/
       main.ts           # local service startup (Node, not browser)
-      server.ts         # authenticated branch and harness HTTP routes
+      server.ts         # authenticated branch, harness, and Cockpit HTTP routes
+      cockpit.ts        # bounded read-only MCP transport + slim single-flight cache
       harness.ts        # feed read + PID and report/log metadata checks
   panel/
     index.html, page.html   # HTML shells
@@ -171,17 +175,19 @@ Clicking **Start Agent**:
 
 ## Explicit session import
 
-**Import running sessions** fetches sessions for every registered project. Pure `selectSessionsToImport` in `domain/autoTask.ts` applies structural eligibility and `initialStatusForNewSession`, deduplicating ids and excluding linked, dismissed, and already-claimed sessions. It has no watermark input. The board uses the same adoption writer and title rules as auto-adoption, with only the age check bypassed. Session ids are claimed synchronously before storage writes; import is disabled until tasks and projects have loaded, and reload waits for pending adoptions. Neither the cutoff nor dismissed ids are changed by import.
+**Import running sessions** fetches sessions for every registered project. Pure `selectSessionsToImport` in `domain/autoTask.ts` accepts only running, retrying, waiting-question, and waiting-permission activity, applies structural eligibility and `initialStatusForNewSession`, and deduplicates ids while excluding linked, dismissed, and already-claimed sessions. Idle sessions, including completed or failed turns, are excluded. It has no watermark input. The board uses the same adoption writer and title rules as auto-adoption, with only the age check bypassed. Session ids are claimed synchronously before storage writes; import is disabled until tasks and projects have loaded, and reload waits for pending adoptions. Neither the cutoff nor dismissed ids are changed by import. Bulk import suppresses per-session adoption toasts and reports one summary: `Imported N`, `Nothing to import`, or `Wait for the agent that is starting`. Reload requests during import or another reload coalesce into one queued follow-up reload, so save-failure recovery is not dropped.
 
 ## Harness activity feed
 
 `src/service/main.ts` chooses one absolute feed path at startup: `AIDE_LANES_FILE` or `~/.local/share/aide/lanes.jsonl`. Relative overrides fail startup. The SDK's service environment allowlist may omit a shell-set override, in which case the default is used. `src/service/server.ts` exposes authenticated `GET /harness-lanes`, rejecting query parameters and request bodies, and delegates to `src/service/harness.ts`. No request can select a feed path.
 
-`domain/harness.ts` validates v1 JSONL records, including required fields, positive integer PIDs, absolute-or-null paths, and ISO timestamps with explicit timezone offsets. Each later valid record replaces the previous valid record with its id; malformed records are skipped and counted in `rejected` and `rejectedLines` (1-based). Records are sorted by their start instant and capped at 200 before filesystem/process checks.
+`domain/harness.ts` validates v1 JSONL records (including optional string-or-null branch for Cockpit linking), including required fields, integer PIDs in 1..2^31−1, absolute-or-null paths, and ISO timestamps with explicit timezone offsets. Each later valid record replaces the previous valid record with its id; malformed records are skipped and counted in `rejected`; `rejectedLines` lists only the first 50 positions (1-based within the retained window). Records are sorted by their start instant and capped at 200 before filesystem/process checks.
 
-The service reads only the feed contents. It uses `process.kill(pid, 0)` (EPERM means the PID exists) and filesystem metadata for report/log paths. Returned metadata is `{path, exists, mtime}`, with milliseconds for mtime; contents are never read. Explicit failed outcome wins; otherwise an alive PID without endedAt is running, endedAt or an existing report is review, and a dead PID without either is lost. Done is never inferred. Missing feed returns exactly `{lanes: [], file: "missing"}`; other read or metadata errors return HTTP 500 rather than a false status claim.
+The service reads at most the last 4 MiB of the feed and returns `truncated` to say whether earlier bytes were omitted. For a truncated window, its first byte provides line-boundary context; any cut first record is rejected and counted as window line 1. The first context byte is not parsed. It checks regular-file metadata before opening; FIFO, device, and directory feeds return exactly `{lanes: [], file: "not-regular"}`. A nonblocking open and descriptor stat protect against replacement between that check and opening. Missing feed returns exactly `{lanes: [], file: "missing"}`; other feed read errors return HTTP 500.
 
-`host/harnessService.ts` uses a narrow `Pick<HostClient, 'serviceRequest'>` and validates the service response. `ui/harness.ts` mounts a separate read-only Harness section with title, kind, project name, status, age, and copyable report path. It polls every 15 seconds, suspends while the document is hidden, and clears its timer/listener on board disposal. Failed requests clear stale cards and show an error. Harness cards never enter task storage, task status sync, task counts, or drag/drop.
+Report/log paths are only stat'ed. Returned metadata is `{path, exists, mtime, size?}`, with milliseconds for mtime and bytes for size; contents are never read. Missing paths have no evidence; other stat failures add `error: "unknown"` with `exists: false, mtime: null` for that lane, without failing the feed. Only a non-empty regular report counts as evidence. Explicit failed outcome wins; otherwise a lane without `endedAt` is running only when `process.kill(pid, 0)` succeeds without error and its `startedAt` is at or after the last boot (`Date.now() - os.uptime()*1000`, allowing one second of clock tolerance). EPERM is not liveness evidence. If boot time cannot be determined, the service logs the error and makes no running claim. An end record or report evidence gives review; otherwise the lane is lost. Done is never inferred. Boot checking rules out pre-boot PID reuse; it cannot establish process identity for PID reuse within the same boot.
+
+`host/harnessService.ts` uses a narrow `Pick<HostClient, 'serviceRequest'>` and validates the service response. `ui/harness.ts` mounts a separate read-only Harness section with title, kind, project name, status, age, and copyable report path. It polls every 15 seconds, suspends while the document is hidden or the page receives `pagehide`, resumes on visibility/`pageshow`, and clears timers/listeners on board disposal. SDK 2.3.2 `API.md` and `HostClient` expose no board visibility or unmount subscription; browser page lifecycle and explicit disposal are the available hooks. Failed requests clear stale cards and show an error. Harness cards never enter task storage, task status sync, task counts, or drag/drop.
 
 Existing manifest permissions remain sufficient: filesystem metadata and PID checks need no new SDK capability. Re-approval is not required.
 
@@ -223,3 +229,13 @@ Acceptance scenarios:
 6. An agent finishes a turn → the task moves to Review, never to Done, until marked Done by hand.
 7. Start a session from the OpenChamber sidebar → one new task appears for it, in the column its activity implies.
 8. Start an agent from a task → only the originating task is linked to that session; no second task is adopted for the same session.
+
+## Read-only Cockpit integration
+
+`service/cockpit.ts` owns the fixed MCP origin and server-side credential file selection (`COCKPIT_API_KEY_FILE` or `~/.config/opencode/secrets/cockpit-api-key`). The authenticated `GET /cockpit-tasks` route accepts no query or body and exposes no tool selector, origin, or credential path. It initializes MCP, sends `notifications/initialized`, forwards an issued `Mcp-Session-Id`, and calls `list_tasks` with no arguments. The internal tool allowlist contains only `list_tasks` and `get_task`; no write tool is reachable. Transport follows the [MCP Streamable HTTP specification](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports), accepting JSON and SSE responses without following redirects.
+
+Each refresh has a 15-second overall timeout and a 12 MiB cap per MCP response (including streamed bytes). The service validates the full task list before returning anything, omits cancelled records, and projects only key, title, status, priority, assignees (email/name only), parentTaskKey, prUrl, updatedAt, estimateHours, spentHours. Only this projection is cached, for exactly 60 seconds after success, with one shared in-flight refresh. Credentials are read on each refresh, never cached, logged, or included in responses. Fixed failure messages avoid reflecting remote error bodies or secrets. Failures return `{status: "unavailable", reason}` with no stale or empty task list.
+
+`domain/cockpit.ts` validates records and implements open-assignee/subtask filters, fixed status grouping, and exact key extraction (`[A-Z]{2,6}-\d+(\.\d+)*`, with token boundaries). No fuzzy matching is used. `host/cockpitService.ts` validates the local response. `ui/cockpit.ts` renders separate read-only cards and polls every 60 seconds using the Harness document/page visibility lifecycle. Email and filters live in `prefs`, defaulting to no email, Mine, and no subtasks. Before email is set the view prompts without guessing. The shared slim snapshot also annotates local task and Harness title/branch matches, independent of the Cockpit view filters; failures clear annotations. Cards never enter local task storage, drag/drop, counts, or status synchronization.
+
+Fake `node:http` MCP servers exercise the actual transport and local API without remote network or real credentials. Tests cover handshake/session propagation, allowlist isolation, slimming/secrecy, failures, bounds, cache/single-flight, preference/filter behavior, exact linking, and visibility lifecycle.

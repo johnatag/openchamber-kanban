@@ -74,8 +74,8 @@ test('a maximum-size description fits in one storage value', async () => {
 test('prefs round-trip and fall back to defaults on junk', async () => {
   const { host, data } = fakeHost();
   assert.deepEqual(await loadPrefs(host), DEFAULT_PREFS);
-  await savePrefs(host, { projectId: 'p9', query: 'login', openTaskId: 't_x' });
-  assert.deepEqual(await loadPrefs(host), { projectId: 'p9', query: 'login', openTaskId: 't_x' });
+  await savePrefs(host, { ...DEFAULT_PREFS, projectId: 'p9', query: 'login', openTaskId: 't_x' });
+  assert.deepEqual(await loadPrefs(host), { ...DEFAULT_PREFS, projectId: 'p9', query: 'login', openTaskId: 't_x' });
   data.set('prefs', JSON.stringify(['junk']));
   assert.deepEqual(await loadPrefs(host), DEFAULT_PREFS);
 });

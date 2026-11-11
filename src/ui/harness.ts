@@ -2,6 +2,7 @@ import type { HostClient } from '@openchamber/sdk';
 import { mountButton } from '@openchamber/sdk/ui';
 import { fetchHarnessLanes } from '../host/harnessService.ts';
 import { describeHostError } from '../host/workspace.ts';
+import { linkedCockpitTasks, type CockpitTask } from '../domain/cockpit.ts';
 import { el } from './dom.ts';
 
 export const mountHarnessFeed = (host: Pick<HostClient, 'serviceRequest' | 'toast'>, root: Element) => {
@@ -13,22 +14,37 @@ export const mountHarnessFeed = (host: Pick<HostClient, 'serviceRequest' | 'toas
   const cards = el('div', 'kb-harness-cards');
   section.append(message, cards);
   root.append(section);
+  let cockpitTasks: CockpitTask[] = [];
+  const annotate = () => {
+    for (const card of cards.querySelectorAll<HTMLElement>('.kb-harness-card')) {
+      card.querySelector('.kb-cockpit-link')?.remove();
+      const links = linkedCockpitTasks(cockpitTasks, card.dataset.title, card.dataset.branch);
+      if (links.length) card.append(el('div', 'kb-mono kb-cockpit-link', links.map(t => t.key + ' · ' + t.status).join(', ')));
+    }
+  };
   let disposed = false;
   let busy = false;
+  let frameVisible = true;
   let timer: ReturnType<typeof setTimeout> | null = null;
 
   const poll = async () => {
-    if (disposed || document.hidden || busy) return;
+    if (disposed || !frameVisible || document.hidden || busy) return;
     busy = true;
     try {
       const result = await fetchHarnessLanes(host);
       if (disposed) return;
       cards.replaceChildren();
+      const notices: string[] = [];
+      if (result.truncated) notices.push('Feed truncated: read only the last 4 MiB.');
+      if (result.rejected) notices.push('Skipped ' + result.rejected + ' malformed feed record(s), lines: ' + result.rejectedLines.join(', ') + (result.rejected > result.rejectedLines.length ? ' (first 50 shown)' : ''));
       message.textContent = result.file === 'missing' ? 'Harness feed file is missing.' :
-        result.rejected ? 'Skipped ' + result.rejected + ' malformed feed record(s), lines: ' + result.rejectedLines.join(', ') :
+        result.file === 'not-regular' ? 'Harness feed is not a regular file.' :
+        notices.length ? notices.join(' ') :
         result.lanes.length ? 'Read-only activity · updated every 15 seconds' : 'No harness activity';
       for (const lane of result.lanes) {
         const card = el('article', 'kb-card kb-harness-card');
+        card.dataset.title = lane.title;
+        card.dataset.branch = lane.branch ?? '';
         card.append(el('div', 'kb-card-title', lane.title));
         const project = lane.project?.split(/[\\/]/).filter(Boolean).at(-1) ?? 'No project';
         const age = Math.max(0, Math.floor((Date.now() - Date.parse(lane.startedAt)) / 60000));
@@ -56,6 +72,7 @@ export const mountHarnessFeed = (host: Pick<HostClient, 'serviceRequest' | 'toas
         }
         cards.append(card);
       }
+      annotate();
     } catch (error) {
       if (!disposed) {
         cards.replaceChildren();
@@ -63,21 +80,30 @@ export const mountHarnessFeed = (host: Pick<HostClient, 'serviceRequest' | 'toas
       }
     } finally {
       busy = false;
-      if (!disposed && !document.hidden) timer = setTimeout(() => { void poll(); }, 15000);
+      if (!disposed && frameVisible && !document.hidden) timer = setTimeout(() => { void poll(); }, 15000);
     }
   };
   const onVisibility = () => {
     if (timer) clearTimeout(timer);
     timer = null;
-    if (!document.hidden) void poll();
+    if (frameVisible && !document.hidden) void poll();
   };
+  // SDK 2.3.2 has no frame visibility/unmount subscription. Page lifecycle
+  // events complement document visibility; the board owns explicit disposal.
+  const onPageHide = () => { frameVisible = false; onVisibility(); };
+  const onPageShow = () => { frameVisible = true; onVisibility(); };
+  window.addEventListener('pagehide', onPageHide);
+  window.addEventListener('pageshow', onPageShow);
   document.addEventListener('visibilitychange', onVisibility);
   void poll();
   return {
+    setCockpitTasks: (tasks: CockpitTask[]) => { cockpitTasks = tasks; annotate(); },
     dispose: () => {
       disposed = true;
       if (timer) clearTimeout(timer);
       document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('pagehide', onPageHide);
+      window.removeEventListener('pageshow', onPageShow);
       section.remove();
     },
   };

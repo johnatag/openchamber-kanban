@@ -2,12 +2,13 @@ export type HarnessLane = {
   v: 1; id: string; title: string; project: string | null;
   kind: 'lane' | 'review' | 'gate'; pid: number; startedAt: string;
   report: string | null; log: string | null;
+  branch?: string | null;
   endedAt?: string; outcome?: 'done' | 'failed';
 };
 export type HarnessStatus = 'running' | 'review' | 'failed' | 'lost';
-export type FileMetadata = { path: string; exists: boolean; mtime: number | null };
+export type FileMetadata = { path: string; exists: boolean; mtime: number | null; size?: number; error?: 'unknown' };
 export type HarnessCard = HarnessLane & { status: HarnessStatus; reportFile: FileMetadata | null; logFile: FileMetadata | null };
-export type HarnessResponse = { lanes: HarnessCard[]; file: 'ok' | 'missing'; rejected: number; rejectedLines: number[] };
+export type HarnessResponse = { lanes: HarnessCard[]; file: 'ok' | 'missing' | 'not-regular'; rejected: number; rejectedLines: number[]; truncated?: boolean };
 
 const absoluteOrNull = (value: unknown) => value === null ||
   (typeof value === 'string' && !value.includes('\0') && (/^\//.test(value) || /^[A-Za-z]:[\\/]/.test(value)));
@@ -27,31 +28,37 @@ export const parseHarnessLane = (value: unknown): HarnessLane | null => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const r = value as Record<string, unknown>;
   if (r.v !== 1 || !text(r.id) || !text(r.title) || !absoluteOrNull(r.project) ||
-      (typeof r.kind !== 'string' || !['lane', 'review', 'gate'].includes(r.kind)) || !Number.isSafeInteger(r.pid) || Number(r.pid) <= 0 ||
+      (typeof r.kind !== 'string' || !['lane', 'review', 'gate'].includes(r.kind)) || !Number.isSafeInteger(r.pid) || Number(r.pid) <= 0 || Number(r.pid) > 2147483647 ||
       !iso(r.startedAt) || !absoluteOrNull(r.report) || !absoluteOrNull(r.log) ||
+      ('branch' in r && r.branch !== null && !text(r.branch)) ||
       ('endedAt' in r && !iso(r.endedAt)) || ('outcome' in r && r.outcome !== 'done' && r.outcome !== 'failed')) return null;
   return {
     v: 1, id: r.id, title: r.title, project: r.project as string | null,
     kind: r.kind as HarnessLane['kind'], pid: r.pid as number, startedAt: r.startedAt,
     report: r.report as string | null, log: r.log as string | null,
+    ...('branch' in r ? { branch: r.branch as string | null } : {}),
     ...('endedAt' in r ? { endedAt: r.endedAt as string } : {}),
     ...('outcome' in r ? { outcome: r.outcome as HarnessLane['outcome'] } : {}),
   };
 };
 
-export const parseHarnessFeed = (input: string) => {
+export const parseHarnessFeed = (input: string, cutFirstLine = false) => {
   const lanes = new Map<string, HarnessLane>();
   const rejectedLines: number[] = [];
+  let rejected = 0;
   const lines = input.split('\n');
   // A final newline terminates a record; it isn't an extra record.
   if (lines.at(-1) === '') lines.pop();
   lines.forEach((line, index) => {
     let lane: HarnessLane | null = null;
-    try { lane = parseHarnessLane(JSON.parse(line)); } catch { /* Count invalid JSON below. */ }
+    try { if (!cutFirstLine || index > 0) lane = parseHarnessLane(JSON.parse(line)); } catch { /* Count invalid JSON below. */ }
     if (lane) lanes.set(lane.id, lane);
-    else rejectedLines.push(index + 1);
+    else {
+      rejected += 1;
+      if (rejectedLines.length < 50) rejectedLines.push(index + 1);
+    }
   });
-  return { lanes: [...lanes.values()], rejected: rejectedLines.length, rejectedLines };
+  return { lanes: [...lanes.values()], rejected, rejectedLines };
 };
 
 export const newestHarnessLanes = (lanes: readonly HarnessLane[]) =>

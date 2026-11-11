@@ -3,7 +3,7 @@ import { mountBanner, mountButton, mountSearchField, mountSelect, mountSpinner }
 import { applyPatch, createTask, DEFAULT_TASK_TITLE, STATUSES, STATUS_LABELS, type Task, type TaskPatch, type TaskStatus } from '../domain/task.ts';
 import { ALL_PROJECTS, NO_PROJECT, groupColumns, planDrop, rankAtEnd, type BoardFilter } from '../domain/board.ts';
 import { deleteTask, loadTasks, saveTask } from '../store/taskStore.ts';
-import { loadPrefs, savePrefs, type Prefs } from '../store/prefs.ts';
+import { DEFAULT_PREFS, loadPrefs, savePrefs, type Prefs } from '../store/prefs.ts';
 import { loadOrphanWatermark, saveOrphanWatermark } from '../store/orphanWatermark.ts';
 import { loadDismissedSessions, saveDismissedSessions } from '../store/dismissedSessions.ts';
 import { describeHostError, describeStartSessionDelivery, fetchSessions, fetchWorktrees, watchProjects } from '../host/workspace.ts';
@@ -15,6 +15,8 @@ import { DEFAULT_SYNC_OPTIONS } from '../domain/sync.ts';
 import { sessionLinkState, worktreeLinkState, type SessionGoneReason, type SessionsView, type WorktreesView } from '../domain/unlink.ts';
 import { selectSessionsToImport, sessionTitleForTask, titleForOrphanSession } from '../domain/autoTask.ts';
 import { buildBaseBranchOptions, describeWorktreeOption, hasKnownBranches, resolveTaskWorktree } from '../domain/worktree.ts';
+import { mountCockpitFeed } from './cockpit.ts';
+import { linkedCockpitTasks, type CockpitTask } from '../domain/cockpit.ts';
 import { mountHarnessFeed } from './harness.ts';
 import { mountTaskDetail } from './detail.ts';
 import { injectStyles } from './styles.ts';
@@ -23,7 +25,7 @@ import { el } from './dom.ts';
 
 export type BoardHost = Pick<
   HostClient,
-  'storage' | 'onProjects' | 'onSessions' | 'onWorktrees' | 'openSession' | 'startSession' | 'serviceRequest' | 'toast' | 'setBadge'
+  'openUrl' | 'storage' | 'onProjects' | 'onSessions' | 'onWorktrees' | 'openSession' | 'startSession' | 'serviceRequest' | 'toast' | 'setBadge'
 >;
 
 /**
@@ -49,7 +51,8 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
   const toolbar = el('div', 'kb-toolbar'); page.append(toolbar);
   const projectSelectWrap = el('div'); toolbar.append(projectSelectWrap);
   const searchWrap = el('div', 'grow'); toolbar.append(searchWrap);
-  const refresh = mountButton(toolbar, { label: 'Refresh', variant: 'ghost', onClick: () => { void reload(); } });
+  // Remains clickable while work is pending: reload coalesces follow-up requests.
+  mountButton(toolbar, { label: 'Refresh', variant: 'ghost', onClick: () => { void reload(); } });
 
   const addRow = el('div', 'kb-row'); page.append(addRow);
   const bannerSlot = el('div'); page.append(bannerSlot);
@@ -91,10 +94,15 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     variant: 'secondary',
     onClick: () => {
       if (importing || reloading || !boardLoaded || !projectsReady) return;
+      if (startingAgents > 0) {
+        void host.toast({ kind: 'info', message: 'Wait for the agent that is starting' }).catch(() => undefined);
+        return;
+      }
       importing = true;
       void (async () => {
         importSessions.update({ loading: true });
-        refresh.update({ disabled: true });
+        let imported = 0;
+        let waitingForStart = false;
         try {
           for (const project of projects) {
             const result = await fetchSessions(host, project.id);
@@ -102,14 +110,16 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
             if (!result.complete) throw new Error('Session import was incomplete. Refresh and try again.');
             const excluded = new Set([...excludedSessionIds(), ...attemptedSessions]);
             for (const { session, status } of selectSessionsToImport(result.sessions, excluded)) {
-              await adoptRunningSession(project.id, session, status, true);
+              if (startingAgents > 0) waitingForStart = true;
+              if (await adoptRunningSession(project.id, session, status, true)) imported += 1;
             }
           }
+          if (!disposed) await host.toast({ kind: 'info', message: imported ? `Imported ${imported}` : waitingForStart ? 'Wait for the agent that is starting' : 'Nothing to import' });
         } catch (error) { notify(error); }
         finally {
           importing = false;
           importSessions.update({ loading: false });
-          refresh.update({ disabled: false });
+          if (reloadQueued && !disposed) void reload();
         }
       })();
     },
@@ -121,16 +131,18 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
 
   let tasks: Task[] = [];
   let projects: GuestProject[] = [];
-  let prefs: Prefs = { projectId: ALL_PROJECTS, query: '', openTaskId: null };
+  let prefs: Prefs = { ...DEFAULT_PREFS };
+  let cockpitTasks: CockpitTask[] = [];
   let filter: BoardFilter = { projectId: ALL_PROJECTS, query: '' };
   let detail: { dispose: () => void } | null = null;
   let draggingId: string | null = null;
   let disposed = false;
   let importing = false;
   let reloading = false;
+  let reloadQueued = false;
   let boardLoaded = false;
   let projectsReady = false;
-  const pendingAdoptions = new Set<Promise<void>>();
+  const pendingAdoptions = new Set<Promise<boolean>>();
   const updateImportAvailability = () => importSessions.update({ disabled: reloading || !boardLoaded || !projectsReady });
 
   /** The one place `tasks` changes, so the session/worktree watchers always see the current set. */
@@ -306,8 +318,9 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
         await saveTask(host, task);
         setTasks([...tasks, task]);
         render();
-        void host.toast({ kind: 'info', message: `Added "${task.title}" to the board (${STATUS_LABELS[status]}) — found a session running with no task.` }).catch(() => undefined);
-      } catch (error) { notify(error); }
+        if (!explicit) void host.toast({ kind: 'info', message: `Added "${task.title}" to the board (${STATUS_LABELS[status]}) — found a session running with no task.` }).catch(() => undefined);
+        return true;
+      } catch (error) { notify(error); return false; }
     })();
     pendingAdoptions.add(adoption);
     void adoption.finally(() => pendingAdoptions.delete(adoption));
@@ -628,6 +641,7 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     const project = task.projectId ? projects.find((p) => p.id === task.projectId)?.name ?? task.projectId : null;
     if (project) meta.append(el('span', 'kb-muted', project));
     if (task.sessionId) meta.append(el('span', 'kb-mono', `session:${task.sessionId.slice(0, 8)}`));
+    for (const linked of linkedCockpitTasks(cockpitTasks, task.title, task.worktree?.branch, task.sourceBranch)) meta.append(el('span', 'kb-mono', linked.key + ' · ' + linked.status));
     card.append(meta);
     if (!task.sessionId) card.append(el('p', 'kb-muted', 'No session yet — click to start an agent or link one.'));
     card.addEventListener('click', (event) => {
@@ -729,10 +743,11 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
   };
 
   const reload = async () => {
-    if (importing || reloading) return;
+    if (disposed) return;
+    if (importing || reloading) { reloadQueued = true; return; }
+    reloadQueued = false;
     reloading = true;
     importSessions.update({ disabled: true });
-    refresh.update({ loading: true });
     try {
       await Promise.all(pendingAdoptions);
       const [{ tasks: loaded, failedKeys }, loadedPrefs, watermark, dismissed] = await Promise.all([
@@ -751,6 +766,7 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
       }
       setTasks(loaded);
       prefs = loadedPrefs;
+      cockpit.setPrefs(prefs);
       filter = { projectId: prefs.projectId, query: prefs.query };
       projectSelect.update({ value: filter.projectId, options: projectOptions() });
       searchField.update({ value: filter.query });
@@ -766,10 +782,16 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     } catch (error) { notify(error); }
     finally {
       reloading = false;
-      refresh.update({ loading: false });
       updateImportAvailability();
+      if (reloadQueued && !disposed) void reload();
     }
   };
+
+  const cockpit = mountCockpitFeed(host, page, async (patch) => {
+    const next = { ...prefs, ...patch };
+    await savePrefs(host, next);
+    prefs = next;
+  }, (next) => { cockpitTasks = next; harness.setCockpitTasks(next); render(); });
 
   let stopProjects: (() => void) | null = null;
   void watchProjects(host, (state) => {
@@ -793,6 +815,7 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     dispose: () => {
       disposed = true;
       harness.dispose();
+      cockpit.dispose();
       stopProjects?.();
       sessionSync.dispose();
       worktreeSync.dispose();

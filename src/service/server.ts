@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import http from 'node:http';
 import path from 'node:path';
+import { createCockpitReader } from './cockpit.ts';
 import { readHarnessFeed } from './harness.ts';
 import { parseGitRefOutput } from '../domain/worktree.ts';
 
@@ -24,12 +25,19 @@ const git = (directory: string, args: string[]): Promise<GitResult> => new Promi
   });
 });
 
-export const createServiceServer = (token: string, lanesFile: string) => {
+export const createServiceServer = (token: string, lanesFile: string, cockpit = createCockpitReader()) => {
   if (!path.isAbsolute(lanesFile)) throw new Error('AIDE_LANES_FILE must be absolute');
   return http.createServer((req, res) => {
     if (req.headers.authorization !== `Bearer ${token}`) { json(res, 401, { error: 'unauthorized' }); return; }
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
     if (url.pathname === '/health') { json(res, 200, { ok: true }); return; }
+    if (url.pathname === '/cockpit-tasks') {
+      if (req.method !== 'GET' || url.search || req.headers['transfer-encoding'] || Number(req.headers['content-length'] ?? 0) !== 0) {
+        json(res, 400, { error: 'cockpit-tasks accepts GET without parameters or body' }); return;
+      }
+      void cockpit().then((body) => json(res, 200, body));
+      return;
+    }
     if (url.pathname === '/harness-lanes') {
       if (req.method !== 'GET' || url.search || req.headers['transfer-encoding'] || Number(req.headers['content-length'] ?? 0) !== 0) {
         json(res, 400, { error: 'harness-lanes accepts GET without parameters or body' }); return;

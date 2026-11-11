@@ -15,3 +15,15 @@ test('import is idempotent with existing claims and duplicate snapshots', () => 
   assert.equal(selected.length, 1);
   assert.deepEqual(selectSessionsToImport([base], new Set(selected.map(({ session }) => session.id))), []);
 });
+
+test('import only takes running, retrying and waiting sessions, regardless of previous outcome', () => {
+  const sessions = [
+    { ...base, id: 'completed', activity: 'idle' as const, outcome: 'completed' as const },
+    { ...base, id: 'failed', activity: 'idle' as const, outcome: 'failed' as const },
+    { ...base, id: 'idle', activity: 'idle' as const },
+    { ...base, id: 'permission', activity: 'waiting-permission' as const },
+    { ...base, id: 'retry', activity: 'retrying' as const, outcome: 'failed' as const },
+  ];
+  assert.deepEqual(selectSessionsToImport(sessions, new Set()).map(({ session, status }) => [session.id, status]),
+    [['permission', 'review'], ['retry', 'in_progress']]);
+});

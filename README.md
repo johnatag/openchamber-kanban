@@ -4,7 +4,7 @@ This is a Kanban board for OpenChamber. A Kanban board is a board with columns, 
 
 This board does one more thing. It can start a real AI agent chat for a task. It keeps the task and the chat linked.
 
-All your data stays on your own OpenChamber server. This extension does not send your data to any other server.
+All your data stays on your own OpenChamber server. The optional Cockpit view reads task metadata from the team’s Cockpit server through the local service.
 
 ## What it does
 
@@ -44,7 +44,7 @@ Open the task (click it, or click Edit), and the border goes away.
 
 ### Tasks can also appear by themselves
 
-If you start a chat in OpenChamber another way — for example, from the sidebar — this board can still find it and make a task for it. The board adopts new, active sessions while it is open, and checks again when you open it. This only works for sessions created **after** you first open the board. Automatic adoption does not look back at older sessions. Click **Import running sessions** to add eligible active sessions of any age from all registered projects. Import keeps the same status and title rules, skips subagents, archived sessions, linked sessions, and sessions whose task you deleted, and leaves the automatic-adoption cutoff unchanged. Sessions started with **Start Agent** are linked to the task you started from, not adopted as another task.
+If you start a chat in OpenChamber another way — for example, from the sidebar — this board can still find it and make a task for it. The board adopts new, active sessions while it is open, and checks again when you open it. This only works for sessions created **after** you first open the board. Automatic adoption does not look back at older sessions. Click **Import running sessions** to add eligible active sessions of any age from all registered projects. Import includes only running, retrying, or question/permission-waiting sessions; idle sessions with completed or failed turns are excluded. Import keeps the same status and title rules, skips subagents, archived sessions, linked sessions, and sessions whose task you deleted, and leaves the automatic-adoption cutoff unchanged. Sessions started with **Start Agent** are linked to the task you started from, not adopted as another task.
 
 ## How it works (a simple picture)
 
@@ -103,10 +103,10 @@ The approval screen calls this "Run a local service" and says it runs with your 
 
 - It runs one command: `git for-each-ref`, which reads repository branch names for the **Based on** dropdown in **Start Agent**. It does not write files or change git history. The board requests branches only for registered projects.
 - It also reads one harness feed file: `$AIDE_LANES_FILE`, if supplied to the service as an absolute path, otherwise `~/.local/share/aide/lanes.jsonl`. Requests cannot choose a different feed file. The SDK currently forwards only a limited environment, so a variable set in your shell may not reach the host-spawned service; the default path works without it.
-- For feed records it checks whether the PID exists and whether the named report and log files exist, including modification times. It never reads report or log contents.
-- It only answers authenticated OpenChamber requests on your computer. It never connects to the internet on its own.
+- For feed records it checks PID reachability, the last boot time, and report/log metadata including modification times and sizes. It never reads report or log contents.
+- It only answers authenticated OpenChamber requests on your computer. For Cockpit, it connects only to `https://cockpit.internal.angelsoftwares.ca/api/mcp/server`.
 
-The board's separate **Harness** section shows up to 200 newest lanes, reviews, and gates as read-only cards. It polls every 15 seconds while the board is visible. These cards are not tasks, cannot be dragged, and do not affect the task count. **Running** means the PID exists with no recorded end; **Review** means an end was recorded or a report exists; **Failed** means the feed explicitly reported failure; **Lost** means the PID is gone with neither an end nor a report. A report path has a copy button; if iframe clipboard access is blocked, it opens the host's copy toast.
+The board's separate **Harness** section shows up to 200 newest lanes, reviews, and gates as read-only cards. It polls every 15 seconds while the board is visible. These cards are not tasks, cannot be dragged, and do not affect the task count. **Running** means the PID probe succeeds without error, the lane started since the last boot (with one second of tolerance), and no end was recorded; **Review** means an end was recorded or a non-empty regular report exists; **Failed** means the feed explicitly reported failure; **Lost** means there is no current liveness evidence, end, or non-empty report. A failed boot-time check is logged and prevents a Running claim. PID reuse within the same boot cannot be ruled out. The service reads at most the last 4 MiB, marks truncated responses, counts a cut first record as rejected, and lists at most 50 rejected line numbers alongside the total (positions are relative to the retained window). FIFO, device, and directory feeds are refused; report/log stat errors affect only their lane and count as unknown evidence. A report path has a copy button; if iframe clipboard access is blocked, it opens the host's copy toast.
 
 A missing feed is shown as missing, and malformed records are skipped with their line numbers shown. An unavailable service is shown as an error. Without the service, **Based on** still offers worktree branches and **Use project default**.
 
@@ -125,3 +125,11 @@ Some things are not possible with the current OpenChamber SDK (SDK = the toolkit
 ## Project files
 
 See `ARCHITECTURE.md` for the full technical write-up: how each file works and the exact SDK limits behind each design choice.
+
+## Cockpit work
+
+The separate **Cockpit** section is read-only. Set your email in the section (saved in board preferences) to see your open assigned tasks, grouped by Cockpit status and preserving its board order. **Mine / All in progress** selects your open work or everybody’s in-progress work; **Include subtasks** includes child tasks. Cards show priority, spent/estimated hours, a PR link that opens externally, and a copy-key button. A task or Harness title or branch containing an exact Cockpit key shows its Cockpit status too.
+
+Only the service reads the API key, at request time, from `$COCKPIT_API_KEY_FILE` or `~/.config/opencode/secrets/cockpit-api-key`. The browser cannot choose this path or access the key. As with the harness environment override, the SDK’s limited forwarded environment may require configuring the service environment directly. The service calls only `list_tasks`; `get_task` is the only other permitted tool, reserved for exact-key lookups. No Cockpit writes occur. Large task text is removed before data reaches the board. Cancelled tasks are omitted.
+
+The slim list is cached for 60 seconds and shared between simultaneous requests. The board polls every 60 seconds only while visible. Missing credentials, authentication, network, timeout, size, and malformed-response failures display **unavailable** with a reason; they never appear as “no work.”

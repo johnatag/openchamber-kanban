@@ -42,3 +42,27 @@ test('sorting compares instants rather than timezone strings', () => {
   ];
   assert.deepEqual(newestHarnessLanes(parseHarnessFeed(records.map(r => JSON.stringify(r)).join('\n')).lanes).map(r => r.id), ['later', 'earlier']);
 });
+
+
+test('PIDs are limited to signed 32-bit positive integers at both boundaries', () => {
+  for (const pid of [1, 2_147_483_647]) {
+    assert.equal(parseHarnessFeed(JSON.stringify({ ...lane, pid })).lanes[0]?.pid, pid);
+  }
+  for (const pid of [0, -1, 1.5, 2_147_483_648, Number.MAX_SAFE_INTEGER]) {
+    assert.equal(parseHarnessFeed(JSON.stringify({ ...lane, pid })).rejected, 1, String(pid));
+  }
+});
+
+test('malformed lines retain the total count while listing only the first 50 positions', () => {
+  const result = parseHarnessFeed(Array.from({ length: 70 }, (_, index) => index === 5 ? JSON.stringify(lane) : 'broken').join('\n'));
+  assert.equal(result.rejected, 69);
+  assert.deepEqual(result.rejectedLines, Array.from({ length: 51 }, (_, index) => index + 1).filter(line => line !== 6));
+  assert.equal(result.lanes.length, 1);
+});
+
+test('optional Harness branch survives the feed boundary for exact Cockpit linking', () => {
+  const parsed = parseHarnessFeed(JSON.stringify({ ...lane, branch: 'feat/COC-385.2' }));
+  assert.equal((parsed.lanes[0] as unknown as Record<string, unknown>)?.branch, 'feat/COC-385.2');
+  assert.equal(parseHarnessFeed(JSON.stringify({ ...lane, branch: null })).rejected, 0);
+  assert.equal(parseHarnessFeed(JSON.stringify({ ...lane, branch: 12 })).rejected, 1);
+});

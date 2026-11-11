@@ -6,6 +6,8 @@ const metadataValid = (value: unknown, file: string | null): boolean => {
   if (!value || typeof value !== 'object') return false;
   const m = value as FileMetadata;
   return m.path === file && typeof m.exists === 'boolean' &&
+    (m.size === undefined || (Number.isSafeInteger(m.size) && m.size >= 0)) &&
+    (m.error === undefined || (m.error === 'unknown' && !m.exists && m.mtime === null)) &&
     (m.mtime === null || (typeof m.mtime === 'number' && Number.isFinite(m.mtime)));
 };
 
@@ -14,9 +16,10 @@ export const fetchHarnessLanes = async (host: Pick<HostClient, 'serviceRequest'>
   if (response.status !== 200) throw new Error('Harness service unavailable (' + response.status + ')');
   const body = JSON.parse(response.body) as HarnessResponse;
   if (!body || !Array.isArray(body.lanes)) throw new Error('Invalid harness feed response');
-  if (body.file === 'missing' && body.lanes.length === 0) return { ...body, rejected: 0, rejectedLines: [] };
+  if ((body.file === 'missing' || body.file === 'not-regular') && body.lanes.length === 0) return { ...body, rejected: 0, rejectedLines: [] };
   if (body.file !== 'ok' || body.lanes.length > 200 || !Number.isSafeInteger(body.rejected) || body.rejected < 0 ||
-      !Array.isArray(body.rejectedLines) || body.rejectedLines.length !== body.rejected ||
+      (body.truncated !== undefined && typeof body.truncated !== 'boolean') ||
+      !Array.isArray(body.rejectedLines) || body.rejectedLines.length !== Math.min(body.rejected, 50) ||
       body.rejectedLines.some(n => !Number.isSafeInteger(n) || n < 1) ||
       body.lanes.some(lane => !parseHarnessLane(lane) || !['running', 'review', 'failed', 'lost'].includes(lane.status) ||
         !metadataValid(lane.reportFile, lane.report) || !metadataValid(lane.logFile, lane.log))) {
