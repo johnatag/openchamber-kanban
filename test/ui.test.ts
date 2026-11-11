@@ -468,7 +468,7 @@ test('deleted tags require non-empty ready lists at least ten minutes apart', as
     assert.equal((await loadProjectTags(fake.host))['gone'], 'work');
     t.mock.timers.tick(1);
     emit({ state: 'ready', projects: [{ id: 'p', name: 'P', directory: '/project' }] }); await settle();
-    assert.equal(fake.stored.has('tag:gone'), false); assert.equal((await loadProjectTags(fake.host))['p'], 'work');
+    assert.deepEqual(fake.stored.get('tag:gone'), { value: null, rev: 2 }); assert.equal((await loadProjectTags(fake.host))['gone'], undefined); assert.equal((await loadProjectTags(fake.host))['p'], 'work');
   } finally { board.dispose(); }
 });
 

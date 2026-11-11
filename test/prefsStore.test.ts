@@ -4,7 +4,7 @@ import type { JsonValue } from '@openchamber/sdk';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createPrefsStore } from '../src/store/prefsStore.ts';
-import { loadPrefs, parsePrefs } from '../src/store/prefs.ts';
+import { loadPrefs, migratePrefs, parsePrefs } from '../src/store/prefs.ts';
 const settle = async () => { for (let i = 0; i < 100; i++) await Promise.resolve(); };
 const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; };
 const fixture = () => {
@@ -86,12 +86,15 @@ test('a failed load never writes defaults and a later writer retries loading saf
 test('legacy tags migrate once, existing per-project values win, and prefs never store tags', async () => {
   const data = new Map<string, JsonValue>([['prefs', { query: 'keep', projectTags: { p: 'work', q: 'work', bad: 'work' } }], ['tag:p', 'personal'], ['tag:bad', 'WORK']]);
   const host = { storage: { get: async (key: string) => data.get(key), keys: async () => [...data.keys()], set: async (key: string, value: JsonValue) => { data.set(key, structuredClone(value)); }, delete: async (key: string) => { data.delete(key); } } };
+  const before = structuredClone([...data]);
+  await loadPrefs(host); assert.deepEqual([...data], before, 'reads never migrate or strip prefs');
+  await migratePrefs(host);
   const first = await loadPrefs(host);
   assert.deepEqual(first.projectTags, { p: 'personal', q: 'work' }); assert.equal(first.query, 'keep');
   assert.equal(Object.hasOwn(data.get('prefs') as object, 'projectTags'), false);
   data.delete('tag:q');
   data.set('prefs', { query: 'updated', projectTags: { q: 'work', resurrected: 'work' } });
-  await loadPrefs(host); assert.equal(data.has('tag:q'), false, 'migration cannot resurrect removed tags');
+  await migratePrefs(host); await loadPrefs(host); assert.equal(data.has('tag:q'), false, 'migration cannot resurrect removed tags');
   assert.equal(data.has('tag:resurrected'), false);
   assert.equal(data.get('tagMigration'), true);
   assert.equal(parsePrefs(data.get('prefs')).query, 'updated');
@@ -121,8 +124,12 @@ test('missing and malformed revisions are zero; safe integer boundaries never ov
     assert.deepEqual(f.stored.get('tag:p'), { value: 'work', rev: expected + 1 });
   }
   f.stored.set('tag:p', { value: 'work', rev: Number.MAX_SAFE_INTEGER });
-  await assert.rejects(saveProjectTag(f.host, 'p', 'personal', 0), /revision exhausted/);
-  assert.deepEqual(f.stored.get('tag:p'), { value: 'work', rev: Number.MAX_SAFE_INTEGER });
+  assert.equal((await saveProjectTag(f.host, 'p', 'work', Number.MAX_SAFE_INTEGER)).conflict, true);
+  assert.equal((await saveProjectTag(f.host, 'p', null, Number.MAX_SAFE_INTEGER)).conflict, true);
+  const personal = saveProjectTag(f.host, 'p', 'personal', 0); await f.flush();
+  assert.equal((await personal).conflict, false);
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'personal', rev: Number.MAX_SAFE_INTEGER });
+  assert.equal((await saveProjectTag(f.host, 'p', 'work', Number.MAX_SAFE_INTEGER)).conflict, true);
 });
 
 test('refresh and unrelated writes adopt Work only above the last local Personal revision', async () => {
@@ -141,7 +148,7 @@ test('refresh and unrelated writes adopt Work only above the last local Personal
   await store.reload(); assert.equal(store.view().projectTags.p, 'personal', 'Personal always adopts');
 });
 
-test('queued cleanup and Work capture revisions before waiting and visibly refuse conflicts', async () => {
+test('queued cleanup and Work capture revisions before waiting; only Work conflicts notify', async () => {
   for (const tag of [null, 'work'] as const) {
     const f = fixture(); f.loading.resolve(); let conflicts = 0;
     const store = createPrefsStore(f.host, () => {}, () => { conflicts++; }); await store.load();
@@ -150,7 +157,7 @@ test('queued cleanup and Work capture revisions before waiting and visibly refus
     f.stored.set('tag:p', { value: 'personal', rev: 1 });
     await f.flush(); await Promise.all([blocked, queued]);
     assert.deepEqual(f.stored.get('tag:p'), { value: 'personal', rev: 1 });
-    assert.equal(store.view().projectTags.p, 'personal'); assert.equal(conflicts, 1);
+    assert.equal(store.view().projectTags.p, 'personal'); assert.equal(conflicts, tag === null ? 0 : 1);
     const retry = store.patch({ projectTags: { p: tag } }); await f.flush(); await retry;
     assert.equal((await loadProjectTags(f.host)).p, tag ?? undefined);
   }
@@ -172,17 +179,54 @@ test('a failed click-time Work read is surfaced after queue delay and requires a
   assert.deepEqual(f.stored.get('tag:p'), { value: 'work', rev: 2 });
 });
 
-test('legacy timestamp records migrate to revision zero and lose timestamps', async () => {
+test('legacy records read as revision zero without storage writes', async () => {
   const f = fixture(); f.loading.resolve();
   f.stored.set('tag:p', { value: 'personal', at: Number.MAX_VALUE });
   f.stored.set('tag:q', { value: 'work', at: -1 });
   const loading = loadPrefs(f.host); await f.flush(); await loading;
-  assert.deepEqual(f.stored.get('tag:p'), { value: 'personal', rev: 0 });
-  assert.deepEqual(f.stored.get('tag:q'), { value: 'work', rev: 0 });
+  assert.equal(f.writes.length, 0);
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'personal', at: Number.MAX_VALUE });
+  assert.deepEqual(f.stored.get('tag:q'), { value: 'work', at: -1 });
+  assert.deepEqual(await loadProjectTag(f.host, 'p'), { value: 'personal', rev: 0 });
+  const write = saveProjectTag(f.host, 'q', 'personal', 0); await f.flush(); await write;
+  assert.deepEqual(f.stored.get('tag:q'), { value: 'personal', rev: 1 });
 });
 
 test('tag ordering contains no Date usage', () => {
   for (const file of ['prefs.ts', 'prefsStore.ts']) {
     assert.doesNotMatch(readFileSync(new URL('../src/store/' + file, import.meta.url), 'utf8'), /\bDate\b/);
   }
+});
+
+
+test('cleanup tombstones preserve revisions and refuse a queued rev-zero Work after Personal', async () => {
+  const f = fixture(); f.loading.resolve(); f.stored.delete('tag:p');
+  const a = createPrefsStore(f.host); const b = createPrefsStore(f.host);
+  await Promise.all([a.load(), b.load()]);
+  const blocked = a.patch({ query: 'block' }); await settle();
+  const staleWork = a.patch({ projectTags: { p: 'work' } }); await settle();
+  const personal = b.patch({ projectTags: { p: 'personal' } });
+  await settle(); f.writes.find(write => write.key === 'tag:p')!.gate.resolve(); await personal;
+  const cleanup = b.patch({ projectTags: { p: null } });
+  await settle(); f.writes.filter(write => write.key === 'tag:p').at(-1)!.gate.resolve(); await cleanup;
+  assert.deepEqual(f.stored.get('tag:p'), { value: null, rev: 2 });
+  assert.equal((await loadProjectTags(f.host)).p, undefined);
+  await f.flush(); await Promise.all([blocked, staleWork]);
+  assert.deepEqual(f.stored.get('tag:p'), { value: null, rev: 2 });
+  assert.equal(a.view().projectTags.p, undefined);
+  const freshWork = a.patch({ projectTags: { p: 'work' } }); await f.flush(); await freshWork;
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'work', rev: 3 });
+});
+
+
+test('migration expects absence, so revision-zero legacy or malformed keys also win', async () => {
+  const f = fixture(); f.loading.resolve(); f.stored.delete('tagMigration');
+  f.stored.set('prefs', { projectTags: { p: 'work', q: 'work', bad: 'work', new: 'work' } });
+  f.stored.set('tag:p', { value: 'personal', rev: 0 });
+  f.stored.set('tag:q', 'personal'); f.stored.set('tag:bad', 'WORK');
+  const migrating = migratePrefs(f.host); await f.flush(); await migrating;
+  assert.deepEqual(f.stored.get('tag:p'), { value: 'personal', rev: 0 });
+  assert.equal(f.stored.get('tag:q'), 'personal'); assert.equal(f.stored.get('tag:bad'), 'WORK');
+  assert.deepEqual(f.stored.get('tag:new'), { value: 'work', rev: 1 });
+  assert.equal(f.stored.get('tagMigration'), true);
 });

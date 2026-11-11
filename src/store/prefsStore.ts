@@ -1,4 +1,4 @@
-import { DEFAULT_PREFS, loadPrefs, loadProjectTag, savePrefs, saveProjectTag, type Prefs, type ProjectTag } from './prefs.ts';
+import { DEFAULT_PREFS, loadPrefs, migratePrefs, loadProjectTag, savePrefs, saveProjectTag, type Prefs, type ProjectTag } from './prefs.ts';
 
 type Host = Parameters<typeof loadPrefs>[0];
 export type PrefsPatch = Partial<Omit<Prefs, 'projectTags'>> & { projectTags?: Record<string, ProjectTag | null> };
@@ -36,7 +36,7 @@ export const createPrefsStore = (host: Host, changed: (prefs: Prefs) => void = (
   const publish = () => changed(view());
   const load = (): Promise<void> => {
     if (loaded) return Promise.resolve();
-    if (!loading) loading = readPrefs().then(value => { saved = value; loaded = true; publish(); }).finally(() => { loading = null; });
+    if (!loading) loading = migratePrefs(host).then(readPrefs).then(value => { saved = value; loaded = true; publish(); }).finally(() => { loading = null; });
     return loading;
   };
   const patch = (patch: PrefsPatch): Promise<void> => {
@@ -68,7 +68,7 @@ export const createPrefsStore = (host: Host, changed: (prefs: Prefs) => void = (
           if (tag === 'personal' && !result.conflict) personalRevisions.set(id, result.rev);
           if (result.tag === 'work' && result.rev <= (personalRevisions.get(id) ?? -1)) result.tag = 'personal';
           if (result.tag === undefined) delete value.projectTags[id]; else value.projectTags[id] = result.tag;
-          conflict ||= result.conflict;
+          conflict ||= result.conflict && tag === 'work';
         }
         if (patches.some(({ patch }) => Object.keys(patch).some(key => key !== 'projectTags'))) await savePrefs(host, value);
         saved = value;
@@ -93,5 +93,13 @@ export const createPrefsStore = (host: Host, changed: (prefs: Prefs) => void = (
     const value = await readPrefs();
     if (started === revision) { saved = value; publish(); }
   };
-  return { load, reload, patch, view, idle: () => queue };
+  const adoptPersonal = (tags: Record<string, ProjectTag | null>) => {
+    const updates = Object.fromEntries(Object.entries(tags).filter(([id, tag]) => tag !== 'work' && view().projectTags[id] === 'work'));
+    if (!Object.keys(updates).length) return;
+    revision++;
+    saved = apply(saved, { projectTags: updates });
+    publish();
+    onConflict();
+  };
+  return { load, reload, patch, view, adoptPersonal, idle: () => queue };
 };

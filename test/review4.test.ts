@@ -176,3 +176,70 @@ test('R6 Work lockout after a bumped Personal', async (t) => {
   assert.equal(tag.value, 'work'); assert.deepEqual(fake.toasts, []);
   board.dispose();
 });
+
+test('R7 Personal against rev MAX_SAFE_INTEGER', async (t) => { await tryPersonal({ value: 'work', rev: Number.MAX_SAFE_INTEGER }, 'rev-MAX', t); });
+test('R7 Personal against odd revs', async (t) => {
+  for (const rev of [-1, 1.5, '7', 2 ** 60, null]) await tryPersonal({ value: 'work', rev }, 'rev=' + String(rev), t);
+});
+test('R7 remount after rev-MAX Personal', async (t) => {
+  const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] }); const polls = { n: 0 };
+  fake.stored.set('prefs', { projectId: 'p', cockpitEmail: 'me@example.com' }); fake.stored.set('tagMigration', true); fake.stored.set('tag:p', { value: 'work', rev: Number.MAX_SAFE_INTEGER });
+  fake.host.serviceRequest = ok(polls) as any;
+  const a = setup(); const b1 = mountKanbanBoard(fake.host, a.element); await settle();
+  const tag = tagSel(a.root); tag.value = 'personal'; tag.dispatchEvent(new Event('change')); await settle(); await settle();
+  b1.dispose(); const p1 = polls.n;
+  const c = setup(); const b2 = mountKanbanBoard(fake.host, c.element); await settle(); t.mock.timers.tick(60000); await settle();
+  assert.deepEqual(fake.stored.get('tag:p'), { value: 'personal', rev: Number.MAX_SAFE_INTEGER });
+  assert.equal(tagSel(c.root).value, 'personal'); assert.equal(polls.n, p1);
+  const choice = tagSel(c.root); choice.value = 'work'; choice.dispatchEvent(new Event('change')); await settle(); await settle();
+  assert.equal(choice.value, 'personal'); assert.equal(polls.n, p1);
+  assert.ok(fake.toasts.includes('Changed elsewhere, choose again'));
+  b2.dispose();
+});
+test('R7 stuck Personal in A, later Work in B, A drains', async (t) => {
+  const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] }); const polls = { n: 0 };
+  fake.stored.set('prefs', { projectId: 'p', cockpitEmail: 'me@example.com' }); fake.stored.set('tagMigration', true); fake.stored.set('tag:p', { value: 'work', rev: 3 });
+  fake.host.serviceRequest = ok(polls) as any;
+  const A = viewHost(fake); const B = viewHost(fake);
+  const a = setup(); const pa = mountKanbanBoard(A.host, a.element); await settle();
+  const b = setup(); const pb = mountKanbanBoard(B.host, b.element); await settle();
+  const release = A.hang(); click(a.root, 'Board'); await settle();
+  const tagA = tagSel(a.root); tagA.value = 'personal'; tagA.dispatchEvent(new Event('change')); await settle();
+  const tagB = tagSel(b.root); tagB.value = 'personal'; tagB.dispatchEvent(new Event('change')); await settle();
+  tagB.value = 'work'; tagB.dispatchEvent(new Event('change')); await settle(); await settle();
+  assert.deepEqual(fake.stored.get('tag:p'), { value: 'work', rev: 5 }); assert.equal(tagB.value, 'work');
+  release(); await settle(); await settle(); const p1 = polls.n; t.mock.timers.tick(60000); await settle(); await settle();
+  assert.deepEqual(fake.stored.get('tag:p'), { value: 'personal', rev: 6 });
+  assert.equal(tagA.value, 'personal'); assert.equal(tagB.value, 'personal'); assert.equal(polls.n, p1);
+  assert.ok(fake.toasts.includes('Changed elsewhere, choose again'));
+  const toastCount = fake.toasts.length; t.mock.timers.tick(60000); await settle(); assert.equal(fake.toasts.length, toastCount);
+  pa.dispose(); pb.dispose();
+});
+test('R7 A Work stuck, B Personal then Work, A drains (CAS refuses?)', async (t) => {
+  const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] }); const polls = { n: 0 };
+  fake.stored.set('prefs', { projectId: 'p', cockpitEmail: 'me@example.com' }); fake.stored.set('tagMigration', true); fake.stored.set('tag:p', { value: 'personal', rev: 1 });
+  fake.host.serviceRequest = ok(polls) as any;
+  const A = viewHost(fake); const B = viewHost(fake);
+  const a = setup(); const pa = mountKanbanBoard(A.host, a.element); await settle();
+  const b = setup(); const pb = mountKanbanBoard(B.host, b.element); await settle();
+  const release = A.hang(); click(a.root, 'Board'); await settle();
+  const tagA = tagSel(a.root); tagA.value = 'work'; tagA.dispatchEvent(new Event('change')); await settle();
+  const tagB = tagSel(b.root); tagB.value = 'work'; tagB.dispatchEvent(new Event('change')); await settle(); await settle();
+  tagB.value = 'personal'; tagB.dispatchEvent(new Event('change')); await settle(); await settle();
+  release(); await settle(); await settle(); const p1 = polls.n; t.mock.timers.tick(60000); await settle(); await settle();
+  assert.equal((await loadProjectTags(fake.host)).p, 'personal');
+  assert.equal(tagA.value, 'personal'); assert.equal(tagB.value, 'personal'); assert.equal(polls.n, p1);
+  assert.ok(fake.toasts.includes('Changed elsewhere, choose again'));
+  pa.dispose(); pb.dispose();
+});
+test('R7 legacy {value,at} strip races a Personal from the other window', async (t) => {
+  const fake = fakeHost(); t.mock.timers.enable({ apis: ['setTimeout'] });
+  fake.stored.set('prefs', { projectId: 'p', cockpitEmail: 'me@example.com' }); fake.stored.set('tagMigration', true); fake.stored.set('tag:p', { value: 'work', at: 5 });
+  const hold = deferred<void>(); const A = viewHost(fake); let held = false;
+  const get = A.host.storage.get; A.host.storage.get = async (k: string) => { const v = await get(k); if (k === 'tag:p' && !held) { held = true; await hold.promise; } return v; };
+  const a = setup(); const pa = mountKanbanBoard(A.host, a.element); await settle();
+  fake.stored.set('tag:p', { value: 'personal', rev: 1 }); // B's Personal lands while A holds its read
+  hold.resolve(); await settle(); await settle();
+  assert.deepEqual(fake.stored.get('tag:p'), { value: 'personal', rev: 1 });
+  pa.dispose();
+});

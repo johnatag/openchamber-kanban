@@ -853,7 +853,8 @@ export const mountKanbanBoard = (host: BoardHost, root: Element) => {
     const scopeId = filter.projectId;
     const scopeProjects = scopeId === ALL_PROJECTS ? projects : projects.filter(project => project.id === scopeId);
     const storedTags = await loadProjectTags(host, scopeProjects.map(project => project.id));
-    if (!projectsReady || scopeId !== filter.projectId) return false;
+    if (disposed || !projectsReady || scopeId !== filter.projectId) return false;
+    prefsStore.adoptPersonal(Object.fromEntries(scopeProjects.filter(project => storedTags[project.id] !== 'work').map(project => [project.id, storedTags[project.id] ?? null])));
     // A project must be Work in both views; a pending Personal intent always wins.
     const tags = Object.fromEntries(projects.filter(project => prefs.projectTags[project.id] === 'work' && storedTags[project.id] === 'work').map(project => [project.id, 'work' as const]));
     return hasCockpitScope({ projects, projectId: scopeId, projectTags: tags });

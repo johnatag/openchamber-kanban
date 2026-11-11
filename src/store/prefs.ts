@@ -55,17 +55,17 @@ const parseTagRecord = (raw: unknown): TagRecord => {
 export const loadProjectTag = async (host: Storage, id: string) => parseTagRecord(await host.storage.get(tagKey(id)));
 
 /** Personal always writes; Work and cleanup compare revisions captured before queue delays. */
-export const saveProjectTag = async (host: Storage, id: string, tag: ProjectTag | null, expected: number) => {
-  const stored = await loadProjectTag(host, id);
-  if (tag !== 'personal' && stored.rev !== expected) return { tag: stored.value, rev: stored.rev, conflict: true };
-  if (tag === null) {
-    await host.storage.delete(tagKey(id));
-    return { tag: undefined, rev: 0, conflict: false };
+export const saveProjectTag = async (host: Storage, id: string, tag: ProjectTag | null, expected: number | null) => {
+  const raw = await host.storage.get(tagKey(id));
+  const stored = parseTagRecord(raw);
+  // null expects an absent key for migration, including no malformed/legacy value.
+  const matches = expected === null ? raw == null : stored.rev === expected;
+  if ((expected === null || tag !== 'personal') && (!matches || stored.rev === Number.MAX_SAFE_INTEGER)) {
+    return { tag: stored.value, rev: stored.rev, conflict: true };
   }
-  if (stored.rev === Number.MAX_SAFE_INTEGER) throw new Error('Project tag revision exhausted');
-  const rev = stored.rev + 1;
+  const rev = Math.min(stored.rev + 1, Number.MAX_SAFE_INTEGER);
   await host.storage.set(tagKey(id), { value: tag, rev });
-  return { tag, rev, conflict: false };
+  return { tag: tag ?? undefined, rev, conflict: false };
 };
 
 export const loadProjectTags = async (host: Storage, ids?: readonly string[]): Promise<Record<string, ProjectTag>> => {
@@ -74,32 +74,24 @@ export const loadProjectTags = async (host: Storage, ids?: readonly string[]): P
   return Object.fromEntries(entries.filter((entry): entry is readonly [string, ProjectTag] => entry[1] !== undefined));
 };
 
-export const loadPrefs = async (host: Storage): Promise<Prefs> => {
+/** Explicit startup migration; ordinary preference and tag reads never write. */
+export const migratePrefs = async (host: Storage): Promise<void> => {
+  if (await host.storage.get(TAG_MIGRATION_KEY) === true) return;
   const raw = await host.storage.get(PREFS_KEY);
   const prefs = parsePrefs(raw);
-  if (await host.storage.get(TAG_MIGRATION_KEY) !== true) {
-    // Existing keys, including malformed values, win over the legacy snapshot.
-    for (const [id, tag] of Object.entries(prefs.projectTags)) {
-      if (await host.storage.get(tagKey(id)) == null) await host.storage.set(tagKey(id), { value: tag, rev: 0 });
-    }
-    await host.storage.set(TAG_MIGRATION_KEY, true);
+  for (const [id, tag] of Object.entries(prefs.projectTags)) {
+    await saveProjectTag(host, id, tag, null);
   }
+  // Re-read so migration cannot replay another surface's old settings.
   if (raw && typeof raw === 'object' && Object.hasOwn(raw, 'projectTags')) {
-    // Read again so migration does not replay the other surface's old settings.
     await savePrefs(host, parsePrefs(await host.storage.get(PREFS_KEY)));
   }
-  // Strip legacy timestamps on a fresh read; never carry them into revision ordering.
-  const keys = (await host.storage.keys()).filter(key => key.startsWith('tag:'));
-  const entries = await Promise.all(keys.map(async key => {
-    const rawTag = await host.storage.get(key);
-    const tag = parseTagRecord(rawTag);
-    if (tag.value !== undefined && rawTag && typeof rawTag === 'object' && Object.hasOwn(rawTag, 'at')) {
-      await host.storage.set(key, { value: tag.value, rev: tag.rev });
-    }
-    return [key.slice(4), tag.value] as const;
-  }));
-  const projectTags = Object.fromEntries(entries.filter((entry): entry is readonly [string, ProjectTag] => entry[1] !== undefined));
-  return { ...prefs, projectTags };
+  await host.storage.set(TAG_MIGRATION_KEY, true);
+};
+
+export const loadPrefs = async (host: Storage): Promise<Prefs> => {
+  const prefs = parsePrefs(await host.storage.get(PREFS_KEY));
+  return { ...prefs, projectTags: await loadProjectTags(host) };
 };
 
 export const savePrefs = (host: Storage, prefs: Prefs) =>

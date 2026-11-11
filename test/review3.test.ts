@@ -204,6 +204,8 @@ test('failed and refused storage checks retry after 60 seconds and remain gated'
     t.mock.timers.tick(60_000); await settle(); assert.equal(polls.n, before + 1);
     t.mock.timers.tick(60_000); await settle(); assert.equal(polls.n, before + 1, 'denied checks never poll');
     fake.stored.set('tag:p', { value: 'work', rev: 101 });
-    t.mock.timers.tick(60_000); await settle(); assert.equal(polls.n, before + 2, 'refused check recovers on timer');
+    t.mock.timers.tick(60_000); await settle(); assert.equal(polls.n, before + 1, 'stored Work cannot undo the Personal adopted by the poll check');
+    const tag = tagSel(dom.root); tag.value = 'work'; tag.dispatchEvent(new Event('change')); await settle();
+    assert.equal(polls.n, before + 2, 'a fresh Work choice re-enables polling');
   } finally { board.dispose(); }
 });
