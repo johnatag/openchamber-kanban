@@ -1,11 +1,12 @@
 import { test, mock, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, mkdir, symlink } from 'node:fs/promises';
+import { mkdtemp, writeFile, mkdir, symlink, chmod } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
 import os, { tmpdir } from 'node:os';
 import path from 'node:path';
+import { loadFeedRoots, feedRootsFilePath } from '../src/service/feedRootsFile.ts';
 import { insideRoots, parseFeedRoots } from '../src/domain/feedRoots.ts';
 import { readHarnessFeed } from '../src/service/harness.ts';
 import { fetchHarnessLanes } from '../src/host/harnessService.ts';
@@ -180,4 +181,67 @@ test('service entrypoint exits 1 on a bad AIDE_FEED_ROOTS without echoing it', a
     assert.match(run.stderr(), /AIDE_FEED_ROOTS entry 1 of 1/);
     assert.ok(!run.stderr().includes('secret'));
   }
+});
+
+const xdgWith = async (content: string | null) => {
+  const xdg = await mkdtemp(path.join(tmpdir(), 'kanban-xdg-'));
+  if (content !== null) { await mkdir(path.join(xdg, 'aide-openchamber')); await writeFile(path.join(xdg, 'aide-openchamber', 'feed-roots'), content); }
+  return xdg;
+};
+
+test('roots file: comments, blank lines and CRLF are ignored; absent file means no filtering', async () => {
+  const xdg = await xdgWith('# profile work\n\n  \n/a/work\r\n/extra\n');
+  assert.deepEqual(loadFeedRoots({ XDG_CONFIG_HOME: xdg }), ROOTS);
+  assert.equal(loadFeedRoots({ XDG_CONFIG_HOME: await xdgWith(null) }), null);
+  assert.equal(feedRootsFilePath({ XDG_CONFIG_HOME: 'relative' }, '/h'), '/h/.config/aide-openchamber/feed-roots');
+});
+
+test('roots file: env wins, even when empty, and the file is not read', async () => {
+  const xdg = await xdgWith('not-absolute\n');
+  assert.deepEqual(loadFeedRoots({ XDG_CONFIG_HOME: xdg, AIDE_FEED_ROOTS: '/env/root' }), ['/env/root']);
+  assert.equal(loadFeedRoots({ XDG_CONFIG_HOME: xdg, AIDE_FEED_ROOTS: '' }), null);
+  assert.throws(() => loadFeedRoots({ XDG_CONFIG_HOME: xdg }), /line 1/);
+});
+
+test('roots file: malformed line, rootless, oversize, symlink, directory and unreadable fail closed without echoing text', async () => {
+  const fails = async (content: string, re: RegExp) => {
+    const xdg = await xdgWith(content);
+    try { loadFeedRoots({ XDG_CONFIG_HOME: xdg }); assert.fail('accepted'); }
+    catch (error) { const m = (error as Error).message; assert.match(m, re); assert.ok(!m.includes('secret'), m); }
+  };
+  await fails('/a/work\n\n# c\nsecret-rel\n', /line 4 is not absolute/);
+  await fails('/a/secret/../x\n', /line 1 is not normalised/);
+  await fails('# only\n\n', /no roots/);
+  await fails('/a/' + 'x'.repeat(64 * 1024) + '\n', /larger than 64 KiB/);
+  // symlink to a perfectly valid file is refused
+  const xdg = await xdgWith(null);
+  await mkdir(path.join(xdg, 'aide-openchamber'));
+  await writeFile(path.join(xdg, 'real'), '/a/work\n');
+  await symlink(path.join(xdg, 'real'), path.join(xdg, 'aide-openchamber', 'feed-roots'));
+  assert.throws(() => loadFeedRoots({ XDG_CONFIG_HOME: xdg }), /not a regular file/);
+  // directory
+  const dirXdg = await xdgWith(null);
+  await mkdir(path.join(dirXdg, 'aide-openchamber', 'feed-roots'), { recursive: true });
+  assert.throws(() => loadFeedRoots({ XDG_CONFIG_HOME: dirXdg }), /not a regular file/);
+  // unreadable
+  if (process.getuid?.() !== 0) {
+    const un = await xdgWith('/a/work\n');
+    await chmod(path.join(un, 'aide-openchamber', 'feed-roots'), 0);
+    assert.throws(() => loadFeedRoots({ XDG_CONFIG_HOME: un }), /could not be read \(EACCES\)/);
+  }
+});
+
+test('service entrypoint reads the roots file when the env var is absent (host env allow-list case)', async () => {
+  const file = await feed(rows());
+  const xdg = await xdgWith('# work profile\n/a/work\n/extra\n');
+  const run = await startService({ AIDE_LANES_FILE: file, XDG_CONFIG_HOME: xdg });
+  const bad = await startService({ XDG_CONFIG_HOME: await xdgWith('secret-rel\n') });
+  try {
+    const body = await getLanes(run.port);
+    assert.deepEqual(body.lanes.map((l: any) => l.id).sort(), VISIBLE);
+    assert.deepEqual(body.filtered, { roots: ROOTS, dropped: 4 });
+    assert.equal(await bad.exited, 1);
+    assert.match(bad.stderr(), /line 1 is not absolute/);
+    assert.ok(!bad.stderr().includes('secret'));
+  } finally { run.child.kill(); }
 });
