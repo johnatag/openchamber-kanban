@@ -6,7 +6,7 @@ import net from 'node:net';
 import { spawn } from 'node:child_process';
 import os, { tmpdir } from 'node:os';
 import path from 'node:path';
-import { loadFeedRoots, feedRootsFilePath } from '../src/service/feedRootsFile.ts';
+import { loadFeedRoots, feedRootsFilePath, type FeedRootsIo } from '../src/service/feedRootsFile.ts';
 import { insideRoots, parseFeedRoots } from '../src/domain/feedRoots.ts';
 import { readHarnessFeed } from '../src/service/harness.ts';
 import { fetchHarnessLanes } from '../src/host/harnessService.ts';
@@ -244,4 +244,48 @@ test('service entrypoint reads the roots file when the env var is absent (host e
     assert.match(bad.stderr(), /line 1 is not absolute/);
     assert.ok(!bad.stderr().includes('secret'));
   } finally { run.child.kill(); }
+});
+
+// A fake descriptor lets a test grow or rewrite the file between fstat and read.
+const fakeIo = (first: string, opts: { second?: string; grewTo?: string; mtime2?: number } = {}): FeedRootsIo => {
+  let content = Buffer.from(first); let pos = 0; let fstats = 0;
+  const stat = (size: number, mtimeMs: number) => ({ isFile: () => true, size, mtimeMs });
+  return {
+    lstat: () => stat(0, 0), open: () => 7, close: () => {},
+    fstat: () => {
+      fstats += 1;
+      if (fstats === 2 && opts.mtime2 !== undefined) return stat(content.length, opts.mtime2);
+      return stat(content.length, 1);
+    },
+    read: (_fd, buffer, offset, length) => {
+      if (opts.grewTo !== undefined && pos === 0) content = Buffer.from(opts.grewTo); // writer extends after the first fstat
+      const n = Math.min(length, content.length - pos);
+      content.copy(buffer, offset, pos, pos + n); pos += n; return n;
+    },
+  };
+};
+const env = { XDG_CONFIG_HOME: '/x' };
+
+test('roots file: a file that grows between fstat and read is rejected, not parsed as a prefix', () => {
+  assert.deepEqual(loadFeedRoots(env, '/h', fakeIo('/a/work\n')), ['/a/work']);
+  assert.throws(() => loadFeedRoots(env, '/h', fakeIo('/', { grewTo: '/\n/a/personal\n' })), /changed while/);
+  assert.throws(() => loadFeedRoots(env, '/h', fakeIo('/a/work\n', { mtime2: 2 })), /changed while/);
+  // a short read that ends before the stated size is also a mismatch
+  const short = fakeIo('/a/work\n'); const realRead = short.read;
+  short.read = (fd, b, o, l) => realRead(fd, b, o, Math.min(l, 3)) && 0;
+  assert.throws(() => loadFeedRoots(env, '/h', short), /changed while/);
+});
+
+test('roots file: reads in a loop over short reads and caps growth at 64 KiB + 1', () => {
+  const chunky = fakeIo('/a/work\n'); const rr = chunky.read;
+  chunky.read = (fd, b, o, l) => rr(fd, b, o, Math.min(l, 2));
+  assert.deepEqual(loadFeedRoots(env, '/h', chunky), ['/a/work']);
+  assert.throws(() => loadFeedRoots(env, '/h', fakeIo('/a\n', { grewTo: '/a/' + 'x'.repeat(70000) })), /larger than 64 KiB/);
+});
+
+test('roots file: a bare "/" is too broad in the file but still allowed from the env', async () => {
+  assert.throws(() => loadFeedRoots(env, '/h', fakeIo('# all\n/\n')), /line 2 root too broad/);
+  const xdg = await xdgWith('/a/work\n/\n');
+  assert.throws(() => loadFeedRoots({ XDG_CONFIG_HOME: xdg }), /line 2 root too broad/);
+  assert.deepEqual(loadFeedRoots({ AIDE_FEED_ROOTS: '/' }), ['/']);
 });
