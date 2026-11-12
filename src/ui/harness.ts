@@ -40,6 +40,7 @@ export const mountHarnessFeed = (host: Pick<HostClient, 'serviceRequest' | 'toas
     const notices: string[] = [];
     if (result.truncated) notices.push('Feed truncated: read only the last 4 MiB.');
     if (result.rejected) notices.push('Skipped ' + result.rejected + ' malformed feed record(s), lines: ' + result.rejectedLines.join(', ') + (result.rejected > result.rejectedLines.length ? ' (first 50 shown)' : ''));
+    if (result.filtered?.dropped) notices.push(result.filtered.dropped + ' row(s) of other profiles hidden.');
     message.textContent = result.file === 'missing' ? 'Harness feed file is missing.' :
       result.file === 'not-regular' ? 'Harness feed is not a regular file.' :
       notices.length ? notices.join(' ') :
