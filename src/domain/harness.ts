@@ -9,7 +9,7 @@ export type HarnessLane = {
 export type HarnessStatus = 'running' | 'review' | 'failed' | 'lost';
 export type FileMetadata = { path: string; exists: boolean; mtime: number | null; size?: number; error?: 'unknown' };
 export type HarnessCard = HarnessLane & { status: HarnessStatus; reportFile: FileMetadata | null; logFile: FileMetadata | null };
-export type HarnessResponse = { lanes: HarnessCard[]; file: 'ok' | 'missing' | 'not-regular'; rejected: number; rejectedLines: number[]; truncated?: boolean };
+export type HarnessResponse = { lanes: HarnessCard[]; file: 'ok' | 'missing' | 'not-regular'; rejected: number; rejectedLines: number[]; truncated?: boolean; filtered?: { roots: string[]; dropped: number } };
 
 const absoluteOrNull = (value: unknown) => value === null ||
   (typeof value === 'string' && !value.includes('\0') && (/^\//.test(value) || /^[A-Za-z]:[\\/]/.test(value)));

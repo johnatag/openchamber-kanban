@@ -1,7 +1,8 @@
 import { constants } from 'node:fs';
 import { open, stat } from 'node:fs/promises';
 import os from 'node:os';
-import { harnessStatus, newestHarnessLanes, parseHarnessFeed, type FileMetadata } from '../domain/harness.ts';
+import { insideRoots } from '../domain/feedRoots.ts';
+import { harnessStatus, newestHarnessLanes, parseHarnessFeed, type FileMetadata, type HarnessCard } from '../domain/harness.ts';
 
 import { processStartTimes, type ProcessStartTimeReader } from './processStartTimes.ts';
 
@@ -23,18 +24,22 @@ const isAlive = (pid: number) => {
   catch { return false; }
 };
 
-export const readHarnessFeed = async (file: string, readStartTimes: ProcessStartTimeReader = processStartTimes.read) => {
+type FeedResult = { lanes: HarnessCard[]; file: string; rejected?: number; rejectedLines?: number[]; truncated?: boolean;
+  filtered?: { roots: string[]; dropped: number } };
+
+export const readHarnessFeed = async (file: string, readStartTimes: ProcessStartTimeReader = processStartTimes.read, roots: readonly string[] | null = null): Promise<FeedResult> => {
+  const filtered = (dropped = 0) => roots ? { filtered: { roots: [...roots], dropped } } : {};
   let input: string;
   let truncated = false;
   let cutFirstLine = false;
   try {
     // Check before opening: a FIFO must never wait for a writer. Nonblocking
     // open and a second stat also protect against replacement after this check.
-    if (!(await stat(file)).isFile()) return { lanes: [], file: 'not-regular' };
+    if (!(await stat(file)).isFile()) return { lanes: [], file: 'not-regular', ...filtered() };
     const handle = await open(file, constants.O_RDONLY | constants.O_NONBLOCK);
     try {
       const info = await handle.stat();
-      if (!info.isFile()) return { lanes: [], file: 'not-regular' };
+      if (!info.isFile()) return { lanes: [], file: 'not-regular', ...filtered() };
       truncated = info.size > FEED_BYTES;
       const buffer = Buffer.alloc(Math.min(info.size, FEED_BYTES));
       const offset = Math.max(0, info.size - FEED_BYTES);
@@ -50,7 +55,7 @@ export const readHarnessFeed = async (file: string, readStartTimes: ProcessStart
       input = buffer.subarray(truncated ? 1 : 0, used).toString('utf8');
     } finally { await handle.close(); }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { lanes: [], file: 'missing' };
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { lanes: [], file: 'missing', ...filtered() };
     throw error;
   }
   const parsed = parseHarnessFeed(input, cutFirstLine);
@@ -58,7 +63,13 @@ export const readHarnessFeed = async (file: string, readStartTimes: ProcessStart
   let bootTime = Infinity;
   try { bootTime = now - os.uptime() * 1000; }
   catch (error) { console.error('Could not determine boot time; harness liveness is unknown', error); }
-  const newest = newestHarnessLanes(parsed.lanes);
+  // Filter before the newest-200 cut so hidden rows never use up visible slots.
+  const visible = roots ? parsed.lanes.filter(lane => insideRoots(lane.project, roots)).map(lane => ({
+    ...lane,
+    report: insideRoots(lane.report, roots) ? lane.report : null,
+    log: insideRoots(lane.log, roots) ? lane.log : null,
+  })) : parsed.lanes;
+  const newest = newestHarnessLanes(visible);
   const starts = await readStartTimes([...new Set(newest.flatMap(lane =>
     lane.commandPid == null ? [lane.pid] : [lane.pid, lane.commandPid]))]);
   const lanes = await Promise.all(newest.map(async lane => {
@@ -75,5 +86,5 @@ export const readHarnessFeed = async (file: string, readStartTimes: ProcessStart
        (lane.commandPid != null && matchesProcess(lane.commandPid, started / 1000 - 2, started / 1000 + 60)));
     return { ...lane, status: future ? 'lost' as const : harnessStatus(lane, alive), reportFile, logFile };
   }));
-  return { lanes, file: 'ok', rejected: parsed.rejected, rejectedLines: parsed.rejectedLines, truncated };
+  return { lanes, file: 'ok', rejected: parsed.rejected, rejectedLines: parsed.rejectedLines, truncated, ...filtered(parsed.lanes.length - visible.length) };
 };

@@ -1,6 +1,7 @@
 // Host-owned, bearer-authenticated loopback service.
 import path from 'node:path';
 import { homedir } from 'node:os';
+import { parseFeedRoots } from '../domain/feedRoots.ts';
 import { createServiceServer } from './server.ts';
 
 const port = Number(process.env.OPENCHAMBER_SERVICE_PORT);
@@ -10,4 +11,7 @@ if (!port || !token) {
   process.exit(1);
 }
 const lanesFile = process.env.AIDE_LANES_FILE ?? path.join(homedir(), '.local/share/aide/lanes.jsonl');
-createServiceServer(token, lanesFile).listen(port, '127.0.0.1');
+let feedRoots: string[] | null;
+try { feedRoots = parseFeedRoots(process.env.AIDE_FEED_ROOTS); }
+catch (error) { console.error((error as Error).message); process.exit(1); }
+createServiceServer(token, lanesFile, undefined, feedRoots).listen(port, '127.0.0.1');

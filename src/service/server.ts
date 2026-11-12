@@ -26,7 +26,7 @@ const git = (directory: string, args: string[]): Promise<GitResult> => new Promi
   });
 });
 
-export const createServiceServer = (token: string, lanesFile: string, cockpit = createCockpitReader()) => {
+export const createServiceServer = (token: string, lanesFile: string, cockpit = createCockpitReader(), feedRoots: readonly string[] | null = null) => {
   if (!path.isAbsolute(lanesFile)) throw new Error('AIDE_LANES_FILE must be absolute');
   return http.createServer((req, res) => {
     if (req.headers.authorization !== `Bearer ${token}`) { json(res, 401, { error: 'unauthorized' }); return; }
@@ -48,7 +48,7 @@ export const createServiceServer = (token: string, lanesFile: string, cockpit = 
       if (req.method !== 'GET' || url.search || req.headers['transfer-encoding'] || Number(req.headers['content-length'] ?? 0) !== 0) {
         json(res, 400, { error: 'harness-lanes accepts GET without parameters or body' }); return;
       }
-      void readHarnessFeed(lanesFile).then(
+      void readHarnessFeed(lanesFile, undefined, feedRoots).then(
         (body) => json(res, 200, body),
         (error: unknown) => {
           console.error('Could not read harness feed', error);

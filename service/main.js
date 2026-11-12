@@ -2,8 +2,35 @@
 import path3 from "node:path";
 import { homedir as homedir2 } from "node:os";
 
+// src/domain/feedRoots.ts
+var normalize = (value) => {
+  if (!value.startsWith("/") || value.includes("\0") || value.includes("\\")) return null;
+  const parts = [];
+  for (const part of value.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") parts.pop();
+    else parts.push(part);
+  }
+  return "/" + parts.join("/");
+};
+var parseFeedRoots = (value) => {
+  if (value === void 0 || value.trim() === "") return null;
+  const roots = value.split(":");
+  for (const root of roots) {
+    if (root === "" || normalize(root) !== root) {
+      throw new Error('AIDE_FEED_ROOTS must be colon-separated absolute normalised directories (no empty entries, ".", "..", repeated or trailing "/"); got ' + JSON.stringify(root));
+    }
+  }
+  return roots;
+};
+var insideRoots = (candidate, roots) => {
+  if (candidate === null) return false;
+  const path4 = normalize(candidate);
+  return path4 !== null && roots.some((root) => path4 === root || path4.startsWith(root === "/" ? "/" : root + "/"));
+};
+
 // src/service/server.ts
-import { execFile } from "node:child_process";
+import { execFile as execFile2 } from "node:child_process";
 import http from "node:http";
 import path2 from "node:path";
 
@@ -254,7 +281,7 @@ var iso = (value) => {
 var parseHarnessLane = (value) => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const r = value;
-  if (r.v !== 1 || !text2(r.id) || !text2(r.title) || !absoluteOrNull(r.project) || (typeof r.kind !== "string" || !["lane", "review", "gate"].includes(r.kind)) || !Number.isSafeInteger(r.pid) || Number(r.pid) <= 0 || Number(r.pid) > 2147483647 || !iso(r.startedAt) || !absoluteOrNull(r.report) || !absoluteOrNull(r.log) || "branch" in r && r.branch !== null && !text2(r.branch) || "endedAt" in r && !iso(r.endedAt) || "outcome" in r && r.outcome !== "done" && r.outcome !== "failed") return null;
+  if (r.v !== 1 || !text2(r.id) || !text2(r.title) || !absoluteOrNull(r.project) || (typeof r.kind !== "string" || !["lane", "review", "gate"].includes(r.kind)) || !Number.isSafeInteger(r.pid) || Number(r.pid) <= 0 || Number(r.pid) > 2147483647 || !iso(r.startedAt) || !absoluteOrNull(r.report) || !absoluteOrNull(r.log) || "commandPid" in r && r.commandPid !== null && (!Number.isSafeInteger(r.commandPid) || Number(r.commandPid) <= 0 || Number(r.commandPid) > 2147483647) || "branch" in r && r.branch !== null && !text2(r.branch) || "endedAt" in r && !iso(r.endedAt) || "outcome" in r && r.outcome !== "done" && r.outcome !== "failed") return null;
   return {
     v: 1,
     id: r.id,
@@ -265,6 +292,7 @@ var parseHarnessLane = (value) => {
     startedAt: r.startedAt,
     report: r.report,
     log: r.log,
+    ..."commandPid" in r ? { commandPid: r.commandPid } : {},
     ..."branch" in r ? { branch: r.branch } : {},
     ..."endedAt" in r ? { endedAt: r.endedAt } : {},
     ..."outcome" in r ? { outcome: r.outcome } : {}
@@ -282,8 +310,10 @@ var parseHarnessFeed = (input, cutFirstLine = false) => {
       if (!cutFirstLine || index > 0) lane = parseHarnessLane(JSON.parse(line));
     } catch {
     }
-    if (lane) lanes.set(lane.id, lane);
-    else {
+    if (lane) {
+      const previous = lanes.get(lane.id);
+      if (!previous || Date.parse(lane.startedAt) >= Date.parse(previous.startedAt)) lanes.set(lane.id, lane);
+    } else {
       rejected += 1;
       if (rejectedLines.length < 50) rejectedLines.push(index + 1);
     }
@@ -291,11 +321,80 @@ var parseHarnessFeed = (input, cutFirstLine = false) => {
   return { lanes: [...lanes.values()], rejected, rejectedLines };
 };
 var newestHarnessLanes = (lanes) => [...lanes].sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt)).slice(0, 200);
-var harnessStatus = (lane, alive, reportExists) => {
+var harnessStatus = (lane, alive) => {
   if (lane.outcome === "failed") return "failed";
+  if (lane.endedAt && lane.outcome === "done") return "review";
   if (!lane.endedAt && alive) return "running";
-  if (lane.endedAt || reportExists) return "review";
   return "lost";
+};
+
+// src/service/processStartTimes.ts
+import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { promisify } from "node:util";
+var parseProcessStartTimes = (output) => {
+  const starts = /* @__PURE__ */ new Map();
+  for (const line of output.split("\n")) {
+    const match = /^\s*(\d+)\s+(\S+)\s+((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s*$/.exec(line);
+    if (!match || match[2].startsWith("Z")) continue;
+    const pid = Number(match[1]);
+    const date = new Date(match[3]);
+    const normalized = date.toString().split(" ").slice(0, 5).join(" ");
+    const fields = match[3].trim().split(/\s+/);
+    const expected = [fields[0], fields[1], fields[2].padStart(2, "0"), fields[4], fields[3]].join(" ");
+    if (Number.isSafeInteger(pid) && pid > 0 && pid <= 2147483647 && Number.isFinite(date.getTime()) && normalized === expected) starts.set(pid, date.getTime() / 1e3);
+  }
+  return starts;
+};
+var exec = promisify(execFile);
+var platformPidMax = async () => {
+  if (process.platform === "darwin") return 99999;
+  if (process.platform === "linux") {
+    try {
+      const value = (await readFile("/proc/sys/kernel/pid_max", "utf8")).trim();
+      const maximum = Number(value);
+      if (/^\d+$/.test(value) && Number.isSafeInteger(maximum) && maximum > 0 && maximum <= 2147483647) return maximum;
+    } catch {
+    }
+  }
+  return null;
+};
+var processStartTimes = {
+  read: async (pids) => {
+    if (!pids.length) return /* @__PURE__ */ new Map();
+    const maximum = await platformPidMax();
+    const eligible = [...new Set(pids)].filter((pid) => Number.isSafeInteger(pid) && pid > 0 && pid <= (maximum ?? 2147483647));
+    if (!eligible.length) return /* @__PURE__ */ new Map();
+    const executable = existsSync("/bin/ps") ? "/bin/ps" : "ps";
+    const query = async (requested) => {
+      try {
+        const { stdout } = await exec(
+          executable,
+          ["-o", "pid=", "-o", "stat=", "-o", "lstart=", "-p", requested.join(",")],
+          { env: { ...process.env, LC_ALL: "C" }, timeout: 2e3, maxBuffer: 128 * 1024 }
+        );
+        return { starts: parseProcessStartTimes(stdout), retry: false, stop: false };
+      } catch (error) {
+        const failure = error;
+        const retry = failure.code === 1 && !failure.stderr && !failure.killed && !failure.signal;
+        if (!retry) console.error("Could not read process start times; harness liveness is unknown", error);
+        return { starts: parseProcessStartTimes(failure.stdout ?? ""), retry, stop: !retry };
+      }
+    };
+    const starts = /* @__PURE__ */ new Map();
+    if (maximum !== null) {
+      const batch = await query(eligible);
+      if (!batch.retry || eligible.length === 1) return batch.starts;
+      for (const [pid, start] of batch.starts) starts.set(pid, start);
+    }
+    for (const pid of eligible) {
+      const result = await query([pid]);
+      for (const [found, start] of result.starts) starts.set(found, start);
+      if (result.stop) break;
+    }
+    return starts;
+  }
 };
 
 // src/service/harness.ts
@@ -323,16 +422,17 @@ var isAlive = (pid) => {
     return false;
   }
 };
-var readHarnessFeed = async (file) => {
+var readHarnessFeed = async (file, readStartTimes = processStartTimes.read, roots = null) => {
+  const filtered = (dropped = 0) => roots ? { filtered: { roots: [...roots], dropped } } : {};
   let input;
   let truncated = false;
   let cutFirstLine = false;
   try {
-    if (!(await stat(file)).isFile()) return { lanes: [], file: "not-regular" };
+    if (!(await stat(file)).isFile()) return { lanes: [], file: "not-regular", ...filtered() };
     const handle = await open2(file, constants2.O_RDONLY | constants2.O_NONBLOCK);
     try {
       const info = await handle.stat();
-      if (!info.isFile()) return { lanes: [], file: "not-regular" };
+      if (!info.isFile()) return { lanes: [], file: "not-regular", ...filtered() };
       truncated = info.size > FEED_BYTES;
       const buffer = Buffer.alloc(Math.min(info.size, FEED_BYTES));
       const offset = Math.max(0, info.size - FEED_BYTES);
@@ -348,23 +448,36 @@ var readHarnessFeed = async (file) => {
       await handle.close();
     }
   } catch (error) {
-    if (error.code === "ENOENT") return { lanes: [], file: "missing" };
+    if (error.code === "ENOENT") return { lanes: [], file: "missing", ...filtered() };
     throw error;
   }
   const parsed = parseHarnessFeed(input, cutFirstLine);
+  const now = Date.now();
   let bootTime = Infinity;
   try {
-    bootTime = Date.now() - os.uptime() * 1e3;
+    bootTime = now - os.uptime() * 1e3;
   } catch (error) {
     console.error("Could not determine boot time; harness liveness is unknown", error);
   }
-  const lanes = await Promise.all(newestHarnessLanes(parsed.lanes).map(async (lane) => {
+  const visible = roots ? parsed.lanes.filter((lane) => insideRoots(lane.project, roots)).map((lane) => ({
+    ...lane,
+    report: insideRoots(lane.report, roots) ? lane.report : null,
+    log: insideRoots(lane.log, roots) ? lane.log : null
+  })) : parsed.lanes;
+  const newest = newestHarnessLanes(visible);
+  const starts = await readStartTimes([...new Set(newest.flatMap((lane) => lane.commandPid == null ? [lane.pid] : [lane.pid, lane.commandPid]))]);
+  const lanes = await Promise.all(newest.map(async (lane) => {
     const [reportFile, logFile] = await Promise.all([metadata(lane.report), metadata(lane.log)]);
-    const alive = Date.parse(lane.startedAt) >= bootTime - BOOT_TOLERANCE_MS && isAlive(lane.pid);
-    const reportEvidence = reportFile?.exists === true && (reportFile.size ?? 0) > 0;
-    return { ...lane, status: harnessStatus(lane, alive, reportEvidence), reportFile, logFile };
+    const started = Date.parse(lane.startedAt);
+    const matchesProcess = (pid, earliest, latest) => {
+      const processStarted = starts.get(pid);
+      return processStarted !== void 0 && Number.isFinite(processStarted) && processStarted >= earliest && processStarted <= latest && isAlive(pid);
+    };
+    const future = started > now + 3e5;
+    const alive = !future && started >= bootTime - BOOT_TOLERANCE_MS && (matchesProcess(lane.pid, started / 1e3 - 2, started / 1e3 + 2) || lane.commandPid != null && matchesProcess(lane.commandPid, started / 1e3 - 2, started / 1e3 + 60));
+    return { ...lane, status: future ? "lost" : harnessStatus(lane, alive), reportFile, logFile };
   }));
-  return { lanes, file: "ok", rejected: parsed.rejected, rejectedLines: parsed.rejectedLines, truncated };
+  return { lanes, file: "ok", rejected: parsed.rejected, rejectedLines: parsed.rejectedLines, truncated, ...filtered(parsed.lanes.length - visible.length) };
 };
 
 // src/domain/worktree.ts
@@ -386,7 +499,7 @@ var json = (res, status, body) => {
   res.end(JSON.stringify(body));
 };
 var git = (directory, args) => new Promise((resolve) => {
-  execFile("git", ["-C", directory, ...args], {
+  execFile2("git", ["-C", directory, ...args], {
     timeout: 8e3,
     maxBuffer: 2 * 1024 * 1024,
     env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" }
@@ -406,7 +519,7 @@ var git = (directory, args) => new Promise((resolve) => {
     resolve({ ok: false, status: 500, error: stderr.trim() || error.message });
   });
 });
-var createServiceServer = (token2, lanesFile2, cockpit = createCockpitReader()) => {
+var createServiceServer = (token2, lanesFile2, cockpit = createCockpitReader(), feedRoots2 = null) => {
   if (!path2.isAbsolute(lanesFile2)) throw new Error("AIDE_LANES_FILE must be absolute");
   return http.createServer((req, res) => {
     if (req.headers.authorization !== `Bearer ${token2}`) {
@@ -443,7 +556,7 @@ var createServiceServer = (token2, lanesFile2, cockpit = createCockpitReader()) 
         json(res, 400, { error: "harness-lanes accepts GET without parameters or body" });
         return;
       }
-      void readHarnessFeed(lanesFile2).then(
+      void readHarnessFeed(lanesFile2, void 0, feedRoots2).then(
         (body) => json(res, 200, body),
         (error) => {
           console.error("Could not read harness feed", error);
@@ -479,4 +592,11 @@ if (!port || !token) {
   process.exit(1);
 }
 var lanesFile = process.env.AIDE_LANES_FILE ?? path3.join(homedir2(), ".local/share/aide/lanes.jsonl");
-createServiceServer(token, lanesFile).listen(port, "127.0.0.1");
+var feedRoots;
+try {
+  feedRoots = parseFeedRoots(process.env.AIDE_FEED_ROOTS);
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
+}
+createServiceServer(token, lanesFile, void 0, feedRoots).listen(port, "127.0.0.1");
