@@ -11,16 +11,18 @@ const normalize = (value: string): string | null => {
   return '/' + parts.join('/');
 };
 
-// Parse AIDE_FEED_ROOTS. Unset or blank means no filtering (null); anything else
-// must be colon-separated absolute, already-normal directories or startup fails.
+// Parse AIDE_FEED_ROOTS. Only undefined and the exact empty string mean no
+// filtering (null); anything else, whitespace included, must be colon-separated
+// absolute, already-normal directories or startup fails. Errors name the entry
+// index and the rule, never the configured text.
 export const parseFeedRoots = (value: string | undefined): string[] | null => {
-  if (value === undefined || value.trim() === '') return null;
+  if (value === undefined || value === '') return null;
   const roots = value.split(':');
-  for (const root of roots) {
-    if (root === '' || normalize(root) !== root) {
-      throw new Error('AIDE_FEED_ROOTS must be colon-separated absolute normalised directories (no empty entries, ".", "..", repeated or trailing "/"); got ' + JSON.stringify(root));
-    }
-  }
+  roots.forEach((root, index) => {
+    const rule = root === '' ? 'is empty' : !root.startsWith('/') ? 'is not absolute' :
+      normalize(root) !== root ? 'is not normalised (no ".", "..", repeated or trailing "/", backslash, NUL or whitespace-only text)' : null;
+    if (rule) throw new Error('AIDE_FEED_ROOTS entry ' + (index + 1) + ' of ' + roots.length + ' ' + rule + '; the value is not shown');
+  });
   return roots;
 };
 

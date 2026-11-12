@@ -14,13 +14,12 @@ var normalize = (value) => {
   return "/" + parts.join("/");
 };
 var parseFeedRoots = (value) => {
-  if (value === void 0 || value.trim() === "") return null;
+  if (value === void 0 || value === "") return null;
   const roots = value.split(":");
-  for (const root of roots) {
-    if (root === "" || normalize(root) !== root) {
-      throw new Error('AIDE_FEED_ROOTS must be colon-separated absolute normalised directories (no empty entries, ".", "..", repeated or trailing "/"); got ' + JSON.stringify(root));
-    }
-  }
+  roots.forEach((root, index) => {
+    const rule = root === "" ? "is empty" : !root.startsWith("/") ? "is not absolute" : normalize(root) !== root ? 'is not normalised (no ".", "..", repeated or trailing "/", backslash, NUL or whitespace-only text)' : null;
+    if (rule) throw new Error("AIDE_FEED_ROOTS entry " + (index + 1) + " of " + roots.length + " " + rule + "; the value is not shown");
+  });
   return roots;
 };
 var insideRoots = (candidate, roots) => {
