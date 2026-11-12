@@ -6,12 +6,16 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readHarnessFeed } from '../src/service/harness.ts';
+import { processStartTimes } from '../src/service/processStartTimes.ts';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Socket } from 'node:net';
 import { createServiceServer } from '../src/service/server.ts';
 
 // Treat uptime as an external OS boundary; the sandbox may prohibit reading it.
-beforeEach(() => { mock.method(os, 'uptime', () => 3600); });
+beforeEach(() => {
+  mock.method(os, 'uptime', () => 3600);
+  mock.method(processStartTimes, 'read', async () => new Map([[process.pid, Date.now() / 1000]]));
+});
 afterEach(() => { mock.restoreAll(); });
 
 test('service uses its fixed feed, returns metadata only, handles missing and rejects file overrides', async () => {
@@ -234,6 +238,7 @@ test('boot-time tolerance includes exactly one second and rejects the preceding 
   mock.method(process, 'kill', () => true);
   try {
     const boot = now - 3600 * 1000;
+    mock.method(processStartTimes, 'read', async () => new Map([[process.pid, (boot - 1000) / 1000]]));
     await writeFile(file, [
       feedLane({ id: 'tolerance', startedAt: new Date(boot - 1000).toISOString() }),
       feedLane({ id: 'too-old', startedAt: new Date(boot - 1001).toISOString() }),

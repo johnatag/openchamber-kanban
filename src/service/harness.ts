@@ -3,6 +3,8 @@ import { open, stat } from 'node:fs/promises';
 import os from 'node:os';
 import { harnessStatus, newestHarnessLanes, parseHarnessFeed, type FileMetadata } from '../domain/harness.ts';
 
+import { processStartTimes, type ProcessStartTimeReader } from './processStartTimes.ts';
+
 const FEED_BYTES = 4 * 1024 * 1024;
 const BOOT_TOLERANCE_MS = 1000;
 
@@ -21,7 +23,7 @@ const isAlive = (pid: number) => {
   catch { return false; }
 };
 
-export const readHarnessFeed = async (file: string) => {
+export const readHarnessFeed = async (file: string, readStartTimes: ProcessStartTimeReader = processStartTimes.read) => {
   let input: string;
   let truncated = false;
   let cutFirstLine = false;
@@ -52,14 +54,26 @@ export const readHarnessFeed = async (file: string) => {
     throw error;
   }
   const parsed = parseHarnessFeed(input, cutFirstLine);
+  const now = Date.now();
   let bootTime = Infinity;
-  try { bootTime = Date.now() - os.uptime() * 1000; }
+  try { bootTime = now - os.uptime() * 1000; }
   catch (error) { console.error('Could not determine boot time; harness liveness is unknown', error); }
-  const lanes = await Promise.all(newestHarnessLanes(parsed.lanes).map(async lane => {
+  const newest = newestHarnessLanes(parsed.lanes);
+  const starts = await readStartTimes([...new Set(newest.flatMap(lane =>
+    lane.commandPid == null ? [lane.pid] : [lane.pid, lane.commandPid]))]);
+  const lanes = await Promise.all(newest.map(async lane => {
     const [reportFile, logFile] = await Promise.all([metadata(lane.report), metadata(lane.log)]);
-    const alive = Date.parse(lane.startedAt) >= bootTime - BOOT_TOLERANCE_MS &&
-      (isAlive(lane.pid) || (lane.commandPid != null && isAlive(lane.commandPid)));
-    return { ...lane, status: harnessStatus(lane, alive), reportFile, logFile };
+    const started = Date.parse(lane.startedAt);
+    const matchesProcess = (pid: number, earliest: number, latest: number) => {
+      const processStarted = starts.get(pid);
+      return processStarted !== undefined && Number.isFinite(processStarted) &&
+        processStarted >= earliest && processStarted <= latest && isAlive(pid);
+    };
+    const future = started > now + 300_000;
+    const alive = !future && started >= bootTime - BOOT_TOLERANCE_MS &&
+      (matchesProcess(lane.pid, -Infinity, started / 1000 + 2) ||
+       (lane.commandPid != null && matchesProcess(lane.commandPid, started / 1000 - 2, started / 1000 + 60)));
+    return { ...lane, status: future ? 'lost' as const : harnessStatus(lane, alive), reportFile, logFile };
   }));
   return { lanes, file: 'ok', rejected: parsed.rejected, rejectedLines: parsed.rejectedLines, truncated };
 };

@@ -55,7 +55,10 @@ export const parseHarnessFeed = (input: string, cutFirstLine = false) => {
   lines.forEach((line, index) => {
     let lane: HarnessLane | null = null;
     try { if (!cutFirstLine || index > 0) lane = parseHarnessLane(JSON.parse(line)); } catch { /* Count invalid JSON below. */ }
-    if (lane) lanes.set(lane.id, lane);
+    if (lane) {
+      const previous = lanes.get(lane.id);
+      if (!previous || Date.parse(lane.startedAt) >= Date.parse(previous.startedAt)) lanes.set(lane.id, lane);
+    }
     else {
       rejected += 1;
       if (rejectedLines.length < 50) rejectedLines.push(index + 1);
