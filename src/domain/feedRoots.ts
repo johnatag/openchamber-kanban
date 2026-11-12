@@ -37,6 +37,7 @@ export const parseFeedRootsFile = (text: string): string[] => {
     if (line.trim() === '' || line.startsWith('#')) return;
     const rule = ruleBroken(line);
     if (rule) throw new Error('feed-roots file line ' + (index + 1) + ' ' + rule + '; the text is not shown');
+    if (line === '/') throw new Error('feed-roots file line ' + (index + 1) + ' root too broad ("/" matches everything); use AIDE_FEED_ROOTS to allow it explicitly');
     roots.push(line);
   });
   if (!roots.length) throw new Error('feed-roots file contains no roots (only blank or comment lines); delete it to disable filtering');

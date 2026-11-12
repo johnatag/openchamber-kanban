@@ -35,6 +35,7 @@ var parseFeedRootsFile = (text3) => {
     if (line.trim() === "" || line.startsWith("#")) return;
     const rule = ruleBroken(line);
     if (rule) throw new Error("feed-roots file line " + (index + 1) + " " + rule + "; the text is not shown");
+    if (line === "/") throw new Error("feed-roots file line " + (index + 1) + ' root too broad ("/" matches everything); use AIDE_FEED_ROOTS to allow it explicitly');
     roots.push(line);
   });
   if (!roots.length) throw new Error("feed-roots file contains no roots (only blank or comment lines); delete it to disable filtering");
@@ -49,28 +50,40 @@ var insideRoots = (candidate, roots) => {
 // src/service/feedRootsFile.ts
 var FEED_ROOTS_MAX_BYTES = 64 * 1024;
 var feedRootsFilePath = (env, home = homedir()) => path.join(env.XDG_CONFIG_HOME && path.isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(home, ".config"), "aide-openchamber", "feed-roots");
-var loadFeedRoots = (env, home = homedir()) => {
+var realIo = {
+  lstat: (file) => lstatSync(file),
+  open: (file) => openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK),
+  fstat: (fd) => fstatSync(fd),
+  read: (fd, buffer, offset, length) => readSync(fd, buffer, offset, length, null),
+  close: closeSync
+};
+var loadFeedRoots = (env, home = homedir(), io = realIo) => {
   if (env.AIDE_FEED_ROOTS !== void 0) return parseFeedRoots(env.AIDE_FEED_ROOTS);
   const file = feedRootsFilePath(env, home);
   try {
-    lstatSync(file);
+    io.lstat(file);
   } catch (error) {
     if (error.code === "ENOENT") return null;
     throw new Error("feed-roots file could not be inspected (" + error.code + ")");
   }
   let fd = null;
   try {
-    if (!lstatSync(file).isFile()) throw new Error("feed-roots file is not a regular file (symlinks are refused)");
-    fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    const info = fstatSync(fd);
-    if (!info.isFile()) throw new Error("feed-roots file is not a regular file");
-    if (info.size > FEED_ROOTS_MAX_BYTES) throw new Error("feed-roots file is larger than 64 KiB");
-    const buffer = Buffer.alloc(info.size);
+    if (!io.lstat(file).isFile()) throw new Error("feed-roots file is not a regular file (symlinks are refused)");
+    fd = io.open(file);
+    const before = io.fstat(fd);
+    if (!before.isFile()) throw new Error("feed-roots file is not a regular file");
+    if (before.size > FEED_ROOTS_MAX_BYTES) throw new Error("feed-roots file is larger than 64 KiB");
+    const buffer = Buffer.alloc(FEED_ROOTS_MAX_BYTES + 1);
     let used = 0;
     while (used < buffer.length) {
-      const n = readSync(fd, buffer, used, buffer.length - used, used);
+      const n = io.read(fd, buffer, used, buffer.length - used);
       if (!n) break;
       used += n;
+    }
+    if (used > FEED_ROOTS_MAX_BYTES) throw new Error("feed-roots file is larger than 64 KiB");
+    const after = io.fstat(fd);
+    if (after.size !== before.size || after.mtimeMs !== before.mtimeMs || used !== before.size) {
+      throw new Error("feed-roots file changed while it was being read; restart the service once it is stable");
     }
     return parseFeedRootsFile(buffer.subarray(0, used).toString("utf8"));
   } catch (error) {
@@ -78,7 +91,7 @@ var loadFeedRoots = (env, home = homedir()) => {
     if (code) throw new Error("feed-roots file could not be read (" + code + ")");
     throw error;
   } finally {
-    if (fd !== null) closeSync(fd);
+    if (fd !== null) io.close(fd);
   }
 };
 
