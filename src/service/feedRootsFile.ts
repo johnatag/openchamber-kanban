@@ -10,7 +10,7 @@ export const FEED_ROOTS_MAX_BYTES = 64 * 1024;
 export const feedRootsFilePath = (env: NodeJS.ProcessEnv, home = homedir()) =>
   path.join(env.XDG_CONFIG_HOME && path.isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(home, '.config'), 'aide-openchamber', 'feed-roots');
 
-type Stat = { isFile(): boolean; size: number; mtimeMs: number };
+type Stat = { isFile(): boolean; size: number; mtimeMs: number; mode: number };
 export type FeedRootsIo = {
   lstat(file: string): Stat; open(file: string): number; fstat(fd: number): Stat;
   read(fd: number, buffer: Buffer, offset: number, length: number): number; close(fd: number): void;
@@ -36,6 +36,7 @@ export const loadFeedRoots = (env: NodeJS.ProcessEnv, home = homedir(), io: Feed
     fd = io.open(file);
     const before = io.fstat(fd);
     if (!before.isFile()) throw new Error('feed-roots file is not a regular file');
+    if (before.mode & 0o022) throw new Error('feed-roots file is writable by group or other; chmod it to 0600');
     if (before.size > FEED_ROOTS_MAX_BYTES) throw new Error('feed-roots file is larger than 64 KiB');
     // Read to EOF with a hard cap of one byte over the limit, whatever fstat said.
     const buffer = Buffer.alloc(FEED_ROOTS_MAX_BYTES + 1);

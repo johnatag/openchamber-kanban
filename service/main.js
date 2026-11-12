@@ -72,6 +72,7 @@ var loadFeedRoots = (env, home = homedir(), io = realIo) => {
     fd = io.open(file);
     const before = io.fstat(fd);
     if (!before.isFile()) throw new Error("feed-roots file is not a regular file");
+    if (before.mode & 18) throw new Error("feed-roots file is writable by group or other; chmod it to 0600");
     if (before.size > FEED_ROOTS_MAX_BYTES) throw new Error("feed-roots file is larger than 64 KiB");
     const buffer = Buffer.alloc(FEED_ROOTS_MAX_BYTES + 1);
     let used = 0;

@@ -249,7 +249,7 @@ test('service entrypoint reads the roots file when the env var is absent (host e
 // A fake descriptor lets a test grow or rewrite the file between fstat and read.
 const fakeIo = (first: string, opts: { second?: string; grewTo?: string; mtime2?: number } = {}): FeedRootsIo => {
   let content = Buffer.from(first); let pos = 0; let fstats = 0;
-  const stat = (size: number, mtimeMs: number) => ({ isFile: () => true, size, mtimeMs });
+  const stat = (size: number, mtimeMs: number) => ({ isFile: () => true, size, mtimeMs, mode: 0o100600 });
   return {
     lstat: () => stat(0, 0), open: () => 7, close: () => {},
     fstat: () => {
@@ -288,4 +288,16 @@ test('roots file: a bare "/" is too broad in the file but still allowed from the
   const xdg = await xdgWith('/a/work\n/\n');
   assert.throws(() => loadFeedRoots({ XDG_CONFIG_HOME: xdg }), /line 2 root too broad/);
   assert.deepEqual(loadFeedRoots({ AIDE_FEED_ROOTS: '/' }), ['/']);
+});
+
+test('roots file: group- or other-writable files are refused without echoing content', async () => {
+  for (const mode of [0o620, 0o602, 0o666]) {
+    const xdg = await xdgWith('/a/secret-root\n');
+    await chmod(path.join(xdg, 'aide-openchamber', 'feed-roots'), mode);
+    try { loadFeedRoots({ XDG_CONFIG_HOME: xdg }); assert.fail('accepted ' + mode.toString(8)); }
+    catch (error) { assert.match((error as Error).message, /writable by group or other/); assert.ok(!(error as Error).message.includes('secret')); }
+  }
+  const ok = await xdgWith('/a/work\n');
+  await chmod(path.join(ok, 'aide-openchamber', 'feed-roots'), 0o644);
+  assert.deepEqual(loadFeedRoots({ XDG_CONFIG_HOME: ok }), ['/a/work']);
 });
