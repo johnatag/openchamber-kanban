@@ -3,6 +3,7 @@ export type HarnessLane = {
   kind: 'lane' | 'review' | 'gate'; pid: number; startedAt: string;
   report: string | null; log: string | null;
   branch?: string | null;
+  commandPid?: number | null;
   endedAt?: string; outcome?: 'done' | 'failed';
 };
 export type HarnessStatus = 'running' | 'review' | 'failed' | 'lost';
@@ -30,12 +31,14 @@ export const parseHarnessLane = (value: unknown): HarnessLane | null => {
   if (r.v !== 1 || !text(r.id) || !text(r.title) || !absoluteOrNull(r.project) ||
       (typeof r.kind !== 'string' || !['lane', 'review', 'gate'].includes(r.kind)) || !Number.isSafeInteger(r.pid) || Number(r.pid) <= 0 || Number(r.pid) > 2147483647 ||
       !iso(r.startedAt) || !absoluteOrNull(r.report) || !absoluteOrNull(r.log) ||
+      ('commandPid' in r && r.commandPid !== null && (!Number.isSafeInteger(r.commandPid) || Number(r.commandPid) <= 0 || Number(r.commandPid) > 2147483647)) ||
       ('branch' in r && r.branch !== null && !text(r.branch)) ||
       ('endedAt' in r && !iso(r.endedAt)) || ('outcome' in r && r.outcome !== 'done' && r.outcome !== 'failed')) return null;
   return {
     v: 1, id: r.id, title: r.title, project: r.project as string | null,
     kind: r.kind as HarnessLane['kind'], pid: r.pid as number, startedAt: r.startedAt,
     report: r.report as string | null, log: r.log as string | null,
+    ...('commandPid' in r ? { commandPid: r.commandPid as number | null } : {}),
     ...('branch' in r ? { branch: r.branch as string | null } : {}),
     ...('endedAt' in r ? { endedAt: r.endedAt as string } : {}),
     ...('outcome' in r ? { outcome: r.outcome as HarnessLane['outcome'] } : {}),
@@ -64,9 +67,9 @@ export const parseHarnessFeed = (input: string, cutFirstLine = false) => {
 export const newestHarnessLanes = (lanes: readonly HarnessLane[]) =>
   [...lanes].sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt)).slice(0, 200);
 
-export const harnessStatus = (lane: HarnessLane, alive: boolean, reportExists: boolean): HarnessStatus => {
+export const harnessStatus = (lane: HarnessLane, alive: boolean): HarnessStatus => {
   if (lane.outcome === 'failed') return 'failed';
+  if (lane.endedAt && lane.outcome === 'done') return 'review';
   if (!lane.endedAt && alive) return 'running';
-  if (lane.endedAt || reportExists) return 'review';
   return 'lost';
 };

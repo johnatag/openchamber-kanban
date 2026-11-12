@@ -19,14 +19,18 @@ test('every required field is required; malformed optional fields and impossible
     assert.equal(parseHarnessFeed(JSON.stringify({ ...lane, ...patch })).rejected, 1);
   }
 });
-test('status distinguishes alive, dead, report, ended and failed without claiming done', () => {
-  const record = parseHarnessFeed(JSON.stringify(lane)).lanes[0]!;
-  assert.equal(harnessStatus(record, true, false), 'running');
-  assert.equal(harnessStatus(record, false, false), 'lost');
-  assert.equal(harnessStatus(record, false, true), 'review');
-  assert.equal(harnessStatus(record, true, true), 'running');
-  assert.equal(harnessStatus({ ...record, endedAt: '2026-11-11T16:00:00Z' }, true, false), 'review');
-  assert.equal(harnessStatus({ ...record, outcome: 'failed' }, true, true), 'failed');
+test('only a done outcome permits review, regardless of report or liveness', () => {
+  const base = parseHarnessFeed(JSON.stringify(lane)).lanes[0]!;
+  for (const alive of [false, true]) {
+    for (const report of [null, '/tmp/report.md']) {
+      const record = { ...base, report };
+      assert.equal(harnessStatus({ ...record, endedAt: '2026-11-11T16:00:00Z', outcome: 'done' }, alive), 'review');
+      assert.equal(harnessStatus({ ...record, endedAt: '2026-11-11T16:00:00Z', outcome: 'failed' }, alive), 'failed');
+      assert.equal(harnessStatus(record, alive), alive ? 'running' : 'lost');
+      assert.equal(harnessStatus({ ...record, outcome: 'done' }, alive), alive ? 'running' : 'lost');
+      assert.equal(harnessStatus({ ...record, endedAt: '2026-11-11T16:00:00Z' }, alive), 'lost');
+    }
+  }
 });
 test('newest cap uses actual timestamps across offsets and returns at most 200', () => {
   const records = Array.from({ length: 202 }, (_, i) => ({ ...lane, id: String(i), startedAt: new Date(i * 1000).toISOString() }));
@@ -65,4 +69,16 @@ test('optional Harness branch survives the feed boundary for exact Cockpit linki
   assert.equal((parsed.lanes[0] as unknown as Record<string, unknown>)?.branch, 'feat/COC-385.2');
   assert.equal(parseHarnessFeed(JSON.stringify({ ...lane, branch: null })).rejected, 0);
   assert.equal(parseHarnessFeed(JSON.stringify({ ...lane, branch: 12 })).rejected, 1);
+});
+
+
+test('command PID accepts null or positive signed 32-bit integers and rejects malformed values', () => {
+  for (const commandPid of [null, 1, 2147483647]) {
+    const parsed = parseHarnessFeed(JSON.stringify({ ...lane, commandPid }));
+    assert.equal(parsed.rejected, 0);
+    assert.equal(parsed.lanes[0]?.commandPid, commandPid);
+  }
+  for (const commandPid of [0, -1, 1.5, 2147483648, '123']) {
+    assert.equal(parseHarnessFeed(JSON.stringify({ ...lane, commandPid })).rejected, 1);
+  }
 });

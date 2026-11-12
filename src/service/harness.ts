@@ -57,9 +57,9 @@ export const readHarnessFeed = async (file: string) => {
   catch (error) { console.error('Could not determine boot time; harness liveness is unknown', error); }
   const lanes = await Promise.all(newestHarnessLanes(parsed.lanes).map(async lane => {
     const [reportFile, logFile] = await Promise.all([metadata(lane.report), metadata(lane.log)]);
-    const alive = Date.parse(lane.startedAt) >= bootTime - BOOT_TOLERANCE_MS && isAlive(lane.pid);
-    const reportEvidence = reportFile?.exists === true && (reportFile.size ?? 0) > 0;
-    return { ...lane, status: harnessStatus(lane, alive, reportEvidence), reportFile, logFile };
+    const alive = Date.parse(lane.startedAt) >= bootTime - BOOT_TOLERANCE_MS &&
+      (isAlive(lane.pid) || (lane.commandPid != null && isAlive(lane.commandPid)));
+    return { ...lane, status: harnessStatus(lane, alive), reportFile, logFile };
   }));
   return { lanes, file: 'ok', rejected: parsed.rejected, rejectedLines: parsed.rejectedLines, truncated };
 };
