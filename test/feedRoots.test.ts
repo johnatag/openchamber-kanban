@@ -1,6 +1,9 @@
 import { test, mock, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, mkdir, symlink } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
+import net from 'node:net';
+import { spawn } from 'node:child_process';
 import os, { tmpdir } from 'node:os';
 import path from 'node:path';
 import { insideRoots, parseFeedRoots } from '../src/domain/feedRoots.ts';
@@ -83,14 +86,24 @@ test('missing feed file still reports the filter', async () => {
 test('unset, blank or null roots leave behaviour unchanged', async () => {
   assert.equal(parseFeedRoots(undefined), null);
   assert.equal(parseFeedRoots(''), null);
-  assert.equal(parseFeedRoots('  '), null);
   const response = await readHarnessFeed(await feed(rows()), async () => new Map(), parseFeedRoots(''));
   assert.equal(response.lanes.length, 9);
   assert.equal((response as any).filtered, undefined);
 });
 
+test('whitespace-only or padded values fail closed, and errors never echo the value', () => {
+  for (const bad of [' ', '\n', '/a/secret-name/../x', 'secret-rel', '/ok:/sec ret//x']) {
+    try { parseFeedRoots(bad); assert.fail('accepted ' + JSON.stringify(bad)); }
+    catch (error) {
+      const message = (error as Error).message;
+      assert.match(message, /entry \d+ of \d+/);
+      for (const frag of ['secret', 'sec ret', '/ok', '/a/']) assert.ok(!message.includes(frag), message);
+    }
+  }
+});
+
 test('malformed roots are rejected', () => {
-  for (const bad of ['relative/dir', '/a/work/', '/a/../work', '/a/./work', '/a//work', '/a:', ':/a', '/a::/b', '/a:rel', 'C:\\work', '/a\0b', '.']) {
+  for (const bad of ['relative/dir', '/a/work/', '/a/../work', '/a/./work', '/a//work', '/a:', ':/a', '/a::/b', '/a:rel', 'C:\\work', '/a\0b', '.', ' ', '\n', '  /a']) {
     assert.throws(() => parseFeedRoots(bad), /AIDE_FEED_ROOTS/, JSON.stringify(bad));
   }
   assert.deepEqual(parseFeedRoots('/a/work:/extra'), ROOTS);
@@ -117,4 +130,54 @@ test('client accepts the filtered field and rejects a malformed one', async () =
   await assert.rejects(fetchHarnessLanes(host({ ...ok, filtered: { roots: ROOTS, dropped: -1 } })), /Invalid/);
   await assert.rejects(fetchHarnessLanes(host({ ...ok, filtered: { roots: [1], dropped: 0 } })), /Invalid/);
   assert.equal((await fetchHarnessLanes(host({ lanes: [], file: 'missing', filtered: { roots: ROOTS, dropped: 0 } }))).filtered?.dropped, 0);
+});
+
+test('symlink aliases are not resolved: a row under a root that links elsewhere is shown (documented limitation)', async () => {
+  const base = await mkdtemp(path.join(tmpdir(), 'kanban-link-'));
+  const root = path.join(base, 'work'); const other = path.join(base, 'personal');
+  await mkdir(root); await mkdir(other);
+  await symlink(other, path.join(root, 'alias'));
+  const response = await readHarnessFeed(await feed([row('via-alias', { project: path.join(root, 'alias', 'p') })]), async () => new Map(), [root]);
+  assert.deepEqual(response.lanes.map((l: any) => l.id), ['via-alias']);
+  assert.match(readFileSync(new URL('../README.md', import.meta.url), 'utf8'), /Symlinks are not resolved/);
+});
+
+const startService = async (env: Record<string, string>) => {
+  const probe = net.createServer(); await new Promise<void>(r => probe.listen(0, '127.0.0.1', r));
+  const port = (probe.address() as net.AddressInfo).port; await new Promise(r => probe.close(r));
+  const child = spawn(process.execPath, ['--experimental-strip-types', new URL('../src/service/main.ts', import.meta.url).pathname],
+    { env: { PATH: process.env.PATH ?? '', OPENCHAMBER_SERVICE_PORT: String(port), OPENCHAMBER_SERVICE_TOKEN: 't', ...env }, stdio: ['ignore', 'ignore', 'pipe'] });
+  let stderr = ''; child.stderr!.on('data', d => { stderr += d; });
+  return { port, child, stderr: () => stderr, exited: new Promise<number | null>(r => child.on('exit', r)) };
+};
+const getLanes = async (port: number) => {
+  for (let i = 0; i < 100; i++) {
+    try { return await (await fetch('http://127.0.0.1:' + port + '/harness-lanes', { headers: { authorization: 'Bearer t' } })).json() as any; }
+    catch { await new Promise(r => setTimeout(r, 50)); }
+  }
+  throw new Error('service did not start');
+};
+
+test('service entrypoint wires AIDE_FEED_ROOTS from the environment into the route', async () => {
+  const file = await feed(rows());
+  const filteredRun = await startService({ AIDE_LANES_FILE: file, AIDE_FEED_ROOTS: ROOTS.join(':') });
+  const plainRun = await startService({ AIDE_LANES_FILE: file });
+  try {
+    const filtered = await getLanes(filteredRun.port);
+    assert.deepEqual(filtered.lanes.map((l: any) => l.id).sort(), VISIBLE);
+    assert.deepEqual(filtered.filtered, { roots: ROOTS, dropped: 4 });
+    // Control: without the env var the same entrypoint is unfiltered, so unwired parsing would fail the lines above.
+    const plain = await getLanes(plainRun.port);
+    assert.equal(plain.filtered, undefined);
+    assert.ok(plain.lanes.some((l: any) => l.id === 'outside'));
+  } finally { filteredRun.child.kill(); plainRun.child.kill(); }
+});
+
+test('service entrypoint exits 1 on a bad AIDE_FEED_ROOTS without echoing it', async () => {
+  for (const bad of ['secret-relative', ' ']) {
+    const run = await startService({ AIDE_FEED_ROOTS: bad });
+    assert.equal(await run.exited, 1);
+    assert.match(run.stderr(), /AIDE_FEED_ROOTS entry 1 of 1/);
+    assert.ok(!run.stderr().includes('secret'));
+  }
 });
