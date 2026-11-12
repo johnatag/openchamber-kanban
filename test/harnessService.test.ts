@@ -6,12 +6,16 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readHarnessFeed } from '../src/service/harness.ts';
+import { processStartTimes } from '../src/service/processStartTimes.ts';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Socket } from 'node:net';
 import { createServiceServer } from '../src/service/server.ts';
 
 // Treat uptime as an external OS boundary; the sandbox may prohibit reading it.
-beforeEach(() => { mock.method(os, 'uptime', () => 3600); });
+beforeEach(() => {
+  mock.method(os, 'uptime', () => 3600);
+  mock.method(processStartTimes, 'read', async () => new Map([[process.pid, Date.now() / 1000]]));
+});
 afterEach(() => { mock.restoreAll(); });
 
 test('service uses its fixed feed, returns metadata only, handles missing and rejects file overrides', async () => {
@@ -52,7 +56,7 @@ test('service uses its fixed feed, returns metadata only, handles missing and re
     for (const query of ['file', 'path', 'directory', 'AIDE_LANES_FILE']) {
       assert.equal((await get('/harness-lanes?' + query + '=/etc/passwd')).status, 400);
     }
-    await writeFile(file, JSON.stringify({ ...base, endedAt: '2026-11-11T11:00:00Z' }));
+    await writeFile(file, JSON.stringify({ ...base, endedAt: '2026-11-11T11:00:00Z', outcome: 'done' }));
     assert.equal((await (await get('/harness-lanes')).json()).lanes[0].status, 'review');
     await rm(file);
     await writeFile(file, Array.from({length: 201}, (_, i) => JSON.stringify({ ...base, id: String(i), report: null })).join('\n'));
@@ -83,12 +87,12 @@ test('a successful PID probe cannot keep a pre-boot lane running, including PID 
     ].map(record => JSON.stringify(record)).join('\n'));
     const response = await readHarnessFeed(file);
     assert.deepEqual(Object.fromEntries(response.lanes.map(lane => [lane.id, lane.status])), {
-      current: 'running', old: 'lost', 'old-pid-one': 'lost', 'old-with-report': 'review',
+      current: 'running', old: 'lost', 'old-pid-one': 'lost', 'old-with-report': 'lost',
     });
   } finally { kill.mock.restore(); await rm(dir, { recursive: true, force: true }); }
 });
 
-test('EPERM is no liveness evidence and falls back to report evidence or lost', async () => {
+test('EPERM is no liveness evidence even when a report exists', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'kanban-foreign-pid-'));
   const file = path.join(dir, 'lanes.jsonl');
   const report = path.join(dir, 'report.md');
@@ -97,7 +101,7 @@ test('EPERM is no liveness evidence and falls back to report evidence or lost', 
     await writeFile(report, 'Review evidence');
     await writeFile(file, [feedLane(), feedLane({ id: 'report', report })].map(record => JSON.stringify(record)).join('\n'));
     const response = await readHarnessFeed(file);
-    assert.deepEqual(response.lanes.map(lane => lane.status), ['lost', 'review']);
+    assert.deepEqual(response.lanes.map(lane => lane.status), ['lost', 'lost']);
   } finally { kill.mock.restore(); await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -205,7 +209,7 @@ test('unavailable boot time gives no liveness evidence and logs once for the fee
     await writeFile(report, 'Review evidence');
     await writeFile(file, [feedLane(), feedLane({ id: 'report', report })].map(record => JSON.stringify(record)).join('\n'));
     const response = await readHarnessFeed(file);
-    assert.deepEqual(response.lanes.map(lane => lane.status), ['lost', 'review']);
+    assert.deepEqual(response.lanes.map(lane => lane.status), ['lost', 'lost']);
     assert.equal(logged.mock.callCount(), 1);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
@@ -234,11 +238,39 @@ test('boot-time tolerance includes exactly one second and rejects the preceding 
   mock.method(process, 'kill', () => true);
   try {
     const boot = now - 3600 * 1000;
+    mock.method(processStartTimes, 'read', async () => new Map([[process.pid, (boot - 1000) / 1000]]));
     await writeFile(file, [
       feedLane({ id: 'tolerance', startedAt: new Date(boot - 1000).toISOString() }),
       feedLane({ id: 'too-old', startedAt: new Date(boot - 1001).toISOString() }),
     ].map(record => JSON.stringify(record)).join('\n'));
     const response = await readHarnessFeed(file);
     assert.deepEqual(response.lanes.map(lane => lane.status), ['running', 'lost']);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+
+test('unfinished lanes use supervisor or command liveness even when a report exists', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'kanban-lost-report-'));
+  const file = path.join(dir, 'lanes.jsonl');
+  const report = path.join(dir, 'report.md');
+  mock.method(process, 'kill', (pid: number) => {
+    if (pid === process.pid) return true;
+    throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+  });
+  try {
+    await writeFile(report, 'Partial report written before supervisor died');
+    await writeFile(file, [
+      feedLane({ id: 'dead', pid: 2147483647, report }),
+      feedLane({ id: 'both-dead', pid: 2147483647, commandPid: 2147483646, report }),
+      feedLane({ id: 'command-alive', pid: 2147483647, commandPid: process.pid, report }),
+      feedLane({ id: 'supervisor-alive', commandPid: 2147483647, report }),
+      feedLane({ id: 'done', pid: 2147483647, outcome: 'done', endedAt: new Date().toISOString() }),
+      feedLane({ id: 'failed', outcome: 'failed', endedAt: new Date().toISOString(), report }),
+    ].map(record => JSON.stringify(record)).join('\n'));
+    const response = await readHarnessFeed(file);
+    assert.deepEqual(Object.fromEntries(response.lanes.map(lane => [lane.id, lane.status])), {
+      dead: 'lost', 'both-dead': 'lost', 'command-alive': 'running', 'supervisor-alive': 'running', done: 'review', failed: 'failed',
+    });
+    assert.equal(response.lanes.find(lane => lane.id === 'dead')?.reportFile?.exists, true);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
