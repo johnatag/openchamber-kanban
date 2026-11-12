@@ -177,3 +177,27 @@ test('unknown PID limit stops isolated queries after an infrastructure failure',
   assert.equal(calls.length, 2);
   assert.equal(errors.mock.callCount(), 1);
 });
+
+for (const platform of ['darwin', 'freebsd']) {
+  test(`${platform} exit 1 with stderr retains rows, stops querying and logs once per poll`, async t => {
+    Object.defineProperty(process, 'platform', { value: platform });
+    const errors = t.mock.method(console, 'error', () => {});
+    // Even whitespace is non-empty stderr, rather than a missing-PID result.
+    for (const stderr of ['ps: keyword not found: bogus\n', ' ']) {
+      calls = [];
+      errors.mock.resetCalls();
+      run = (_file, args) => {
+        calls.push(args);
+        if (args.at(-1) === '41') return row(41);
+        throw Object.assign(failure(1, row(42)), { stderr });
+      };
+      for (let poll = 1; poll <= 2; poll++) {
+        const expected = platform === 'darwin' ? [42] : [41, 42];
+        assert.deepEqual(await processStartTimes.read([41, 42, 43]),
+          new Map(expected.map(pid => [pid, stamp.getTime() / 1000])));
+        assert.equal(calls.length, poll * (platform === 'darwin' ? 1 : 2));
+        assert.equal(errors.mock.callCount(), poll);
+      }
+    }
+  });
+}

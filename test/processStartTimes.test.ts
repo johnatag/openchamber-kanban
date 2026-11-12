@@ -1,8 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
 import { once } from 'node:events';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { parseProcessStartTimes, processStartTimes } from '../src/service/processStartTimes.ts';
@@ -65,3 +66,43 @@ test('ps state excludes zombies while retaining living process start times', () 
   const start = new Date(2026, 10, 11, 12, 34, 56).getTime() / 1000;
   assert.deepEqual(parseProcessStartTimes(output), new Map([[41, start], [44, start]]));
 });
+
+for (const platform of ['darwin', 'freebsd']) {
+  test(`${platform} BusyBox-shaped ps usage error logs once and stops each poll`, async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'kanban-busybox-ps-'));
+    try {
+      await writeFile(path.join(dir, 'ps'), `#!/bin/sh
+echo call >> "$PS_CALLS"
+echo "ps: unrecognized option: p" >&2
+echo "BusyBox v1.38.0 multi-call binary." >&2
+echo "Usage: ps [-o COL1,COL2=HEADER] [-T]" >&2
+exit 1
+`, { mode: 0o755 });
+      // Run the real execFile boundary in isolation, selecting the fake PATH ps.
+      const script = `
+        import fs from 'node:fs';
+        import { syncBuiltinESMExports } from 'node:module';
+        fs.existsSync = () => false;
+        syncBuiltinESMExports();
+        Object.defineProperty(process, 'platform', { value: ${JSON.stringify(platform)} });
+        const { processStartTimes } = await import(${JSON.stringify(new URL('../src/service/processStartTimes.ts', import.meta.url).href)});
+        const errors = [];
+        console.error = (...args) => errors.push(args[1].stderr);
+        const results = [];
+        for (let poll = 0; poll < 2; poll++) results.push([...await processStartTimes.read([41, 42, 43])]);
+        console.log(JSON.stringify({ results, errors }));
+      `;
+      const callsFile = path.join(dir, 'calls');
+      const { stdout } = await promisify(execFile)(process.execPath,
+        ['--experimental-strip-types', '--input-type=module', '-e', script],
+        { env: { ...process.env, PATH: dir, PS_CALLS: callsFile } });
+      const result = JSON.parse(stdout);
+      assert.deepEqual(result.results, [[], []]);
+      assert.equal(result.errors.length, 2);
+      assert.ok(result.errors.every((stderr: string) => stderr.includes('BusyBox') && stderr.includes('Usage: ps')));
+      assert.equal(await readFile(callsFile, 'utf8'), 'call\ncall\n');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}

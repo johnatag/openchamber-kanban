@@ -50,9 +50,9 @@ export const processStartTimes: { read: ProcessStartTimeReader } = {
           { env: { ...process.env, LC_ALL: 'C' }, timeout: 2000, maxBuffer: 128 * 1024 });
         return { starts: parseProcessStartTimes(stdout), retry: false, stop: false };
       } catch (error) {
-        const failure = error as { code?: unknown; stdout?: string; killed?: boolean; signal?: string | null };
-        // Exit 1 (including empty output when all PIDs died) is normal.
-        const retry = failure.code === 1 && !failure.killed && !failure.signal;
+        const failure = error as { code?: unknown; stdout?: string; stderr?: string; killed?: boolean; signal?: string | null };
+        // Only exit 1 with empty stderr means missing PIDs; diagnostics mean ps failed.
+        const retry = failure.code === 1 && !failure.stderr && !failure.killed && !failure.signal;
         if (!retry) console.error('Could not read process start times; harness liveness is unknown', error);
         return { starts: parseProcessStartTimes(failure.stdout ?? ''), retry, stop: !retry };
       }
