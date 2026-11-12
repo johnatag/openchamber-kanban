@@ -10,13 +10,13 @@ export type ProcessStartTimeReader = (pids: readonly number[]) => Promise<Readon
 export const parseProcessStartTimes = (output: string): Map<number, number> => {
   const starts = new Map<number, number>();
   for (const line of output.split('\n')) {
-    const match = /^\s*(\d+)\s+((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s*$/.exec(line);
-    if (!match) continue;
+    const match = /^\s*(\d+)\s+(\S+)\s+((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s*$/.exec(line);
+    if (!match || match[2]!.startsWith('Z')) continue;
     const pid = Number(match[1]);
-    const date = new Date(match[2]!);
+    const date = new Date(match[3]!);
     // Round-trip to reject dates that Date.parse normalizes (e.g. February 30).
     const normalized = date.toString().split(' ').slice(0, 5).join(' ');
-    const fields = match[2]!.trim().split(/\s+/);
+    const fields = match[3]!.trim().split(/\s+/);
     const expected = [fields[0], fields[1], fields[2]!.padStart(2, '0'), fields[4], fields[3]].join(' ');
     if (Number.isSafeInteger(pid) && pid > 0 && pid <= 2147483647 &&
         Number.isFinite(date.getTime()) && normalized === expected) starts.set(pid, date.getTime() / 1000);
@@ -46,25 +46,28 @@ export const processStartTimes: { read: ProcessStartTimeReader } = {
     const executable = existsSync('/bin/ps') ? '/bin/ps' : 'ps';
     const query = async (requested: number[]) => {
       try {
-        const { stdout } = await exec(executable, ['-o', 'pid=', '-o', 'lstart=', '-p', requested.join(',')],
+        const { stdout } = await exec(executable, ['-o', 'pid=', '-o', 'stat=', '-o', 'lstart=', '-p', requested.join(',')],
           { env: { ...process.env, LC_ALL: 'C' }, timeout: 2000, maxBuffer: 128 * 1024 });
-        return { starts: parseProcessStartTimes(stdout), failed: false };
+        return { starts: parseProcessStartTimes(stdout), retry: false, stop: false };
       } catch (error) {
-        const failure = error as { code?: unknown; stdout?: string };
+        const failure = error as { code?: unknown; stdout?: string; killed?: boolean; signal?: string | null };
         // Exit 1 (including empty output when all PIDs died) is normal.
-        if (failure.code !== 1) console.error('Could not read process start times; harness liveness is unknown', error);
-        return { starts: parseProcessStartTimes(failure.stdout ?? ''), failed: true };
+        const retry = failure.code === 1 && !failure.killed && !failure.signal;
+        if (!retry) console.error('Could not read process start times; harness liveness is unknown', error);
+        return { starts: parseProcessStartTimes(failure.stdout ?? ''), retry, stop: !retry };
       }
     };
     const starts = new Map<number, number>();
     if (maximum !== null) {
       const batch = await query(eligible);
-      if (!batch.failed || eligible.length === 1) return batch.starts;
+      if (!batch.retry || eligible.length === 1) return batch.starts;
       for (const [pid, start] of batch.starts) starts.set(pid, start);
     }
     // A rejected PID must never discard evidence for its neighbours.
     for (const pid of eligible) {
-      for (const [found, start] of (await query([pid])).starts) starts.set(found, start);
+      const result = await query([pid]);
+      for (const [found, start] of result.starts) starts.set(found, start);
+      if (result.stop) break;
     }
     return starts;
   },

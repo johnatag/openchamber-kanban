@@ -26,7 +26,7 @@ syncBuiltinESMExports();
 
 const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
 const stamp = new Date(2026, 10, 11, 12, 34, 56);
-const row = (pid: number) => `${pid} Wed Nov 11 12:34:56 2026\n`;
+const row = (pid: number) => `${pid} S Wed Nov 11 12:34:56 2026\n`;
 const failure = (code: number | string, stdout = '') => Object.assign(new Error('ps failed'), { code, stdout });
 let calls: string[][];
 beforeEach(() => {
@@ -139,5 +139,41 @@ test('inspection permission errors still surface and return no evidence', async 
   const errors = t.mock.method(console, 'error', () => {});
   run = () => { throw failure('EPERM'); };
   assert.deepEqual(await processStartTimes.read([42]), new Map());
+  assert.equal(errors.mock.callCount(), 1);
+});
+
+for (const [name, properties] of [
+  ['missing executable', { code: 'ENOENT' }],
+  ['inaccessible executable', { code: 'EACCES' }],
+  ['timeout', { code: null, killed: true, signal: 'SIGTERM' }],
+  ['signal despite exit code 1', { code: 1, signal: 'SIGTERM' }],
+  ['killed despite exit code 1', { code: 1, killed: true }],
+  ['output overflow', { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }],
+  ['other exit status', { code: 2 }],
+] as const) {
+  test(`${name} retains batch rows, stops querying and logs once per poll`, async t => {
+    const errors = t.mock.method(console, 'error', () => {});
+    run = (_file, args) => {
+      calls.push(args);
+      throw Object.assign(new Error(name), properties, { stdout: row(41) });
+    };
+    for (let poll = 1; poll <= 2; poll++) {
+      assert.deepEqual(await processStartTimes.read([41, 42, 43]), new Map([[41, stamp.getTime() / 1000]]));
+      assert.equal(calls.length, poll);
+      assert.equal(errors.mock.callCount(), poll);
+    }
+  });
+}
+
+test('unknown PID limit stops isolated queries after an infrastructure failure', async t => {
+  Object.defineProperty(process, 'platform', { value: 'freebsd' });
+  const errors = t.mock.method(console, 'error', () => {});
+  run = (_file, args) => {
+    calls.push(args);
+    if (args.at(-1) === '41') return row(41);
+    throw failure('ENOENT');
+  };
+  assert.deepEqual(await processStartTimes.read([41, 42, 43]), new Map([[41, stamp.getTime() / 1000]]));
+  assert.equal(calls.length, 2);
   assert.equal(errors.mock.callCount(), 1);
 });

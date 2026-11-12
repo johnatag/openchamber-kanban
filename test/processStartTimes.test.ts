@@ -10,12 +10,12 @@ import { readHarnessFeed } from '../src/service/harness.ts';
 
 test('ps rows parse C-locale dates to epoch seconds in local time; unreadable or malformed rows are ignored', () => {
   assert.deepEqual(parseProcessStartTimes([
-    '   101 Wed Nov 11 12:34:56 2026',
-    '102 Thu Jan  1 00:00:00 2026',
-    '103 -', '104 unknown', '105 Wed Nov 11 25:00:00 2026',
-    '106 Mon Feb 30 12:00:00 2026', '107 Wed Nov 11 12:34:56 2026 garbage',
-    '0 Wed Nov 11 12:34:56 2026', '2147483648 Wed Nov 11 12:34:56 2026',
-    '108 Mer Nov 11 12:34:56 2026',
+    '   101 S Wed Nov 11 12:34:56 2026',
+    '102 S Thu Jan  1 00:00:00 2026',
+    '103 -', '104 unknown', '105 S Wed Nov 11 25:00:00 2026',
+    '106 S Mon Feb 30 12:00:00 2026', '107 S Wed Nov 11 12:34:56 2026 garbage',
+    '0 S Wed Nov 11 12:34:56 2026', '2147483648 S Wed Nov 11 12:34:56 2026',
+    '108 S Mer Nov 11 12:34:56 2026',
   ].join('\n')), new Map([
     [101, new Date(2026, 10, 11, 12, 34, 56).getTime() / 1000],
     [102, new Date(2026, 0, 1).getTime() / 1000],
@@ -53,4 +53,15 @@ test('real live child is identified, or lost when this machine denies process in
     await exited;
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('ps state excludes zombies while retaining living process start times', () => {
+  const output = [
+    '41 S Wed Nov 11 12:34:56 2026',
+    '42 Z Wed Nov 11 12:34:56 2026',
+    '43 Z+ Wed Nov 11 12:34:56 2026',
+    '44 Ss+ Wed Nov 11 12:34:56 2026',
+  ].join('\n');
+  const start = new Date(2026, 10, 11, 12, 34, 56).getTime() / 1000;
+  assert.deepEqual(parseProcessStartTimes(output), new Map([[41, start], [44, start]]));
 });
