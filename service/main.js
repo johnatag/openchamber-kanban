@@ -1,6 +1,11 @@
 // src/service/main.ts
-import path3 from "node:path";
-import { homedir as homedir2 } from "node:os";
+import path4 from "node:path";
+import { homedir as homedir3 } from "node:os";
+
+// src/service/feedRootsFile.ts
+import { constants, closeSync, fstatSync, lstatSync, openSync, readSync } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
 
 // src/domain/feedRoots.ts
 var normalize = (value) => {
@@ -13,25 +18,74 @@ var normalize = (value) => {
   }
   return "/" + parts.join("/");
 };
+var ruleBroken = (root) => root === "" ? "is empty" : !root.startsWith("/") ? "is not absolute" : normalize(root) !== root ? 'is not normalised (no ".", "..", repeated or trailing "/", backslash, NUL or whitespace-only text)' : null;
 var parseFeedRoots = (value) => {
   if (value === void 0 || value === "") return null;
   const roots = value.split(":");
   roots.forEach((root, index) => {
-    const rule = root === "" ? "is empty" : !root.startsWith("/") ? "is not absolute" : normalize(root) !== root ? 'is not normalised (no ".", "..", repeated or trailing "/", backslash, NUL or whitespace-only text)' : null;
+    const rule = ruleBroken(root);
     if (rule) throw new Error("AIDE_FEED_ROOTS entry " + (index + 1) + " of " + roots.length + " " + rule + "; the value is not shown");
   });
   return roots;
 };
+var parseFeedRootsFile = (text3) => {
+  const roots = [];
+  text3.split("\n").forEach((raw, index) => {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    if (line.trim() === "" || line.startsWith("#")) return;
+    const rule = ruleBroken(line);
+    if (rule) throw new Error("feed-roots file line " + (index + 1) + " " + rule + "; the text is not shown");
+    roots.push(line);
+  });
+  if (!roots.length) throw new Error("feed-roots file contains no roots (only blank or comment lines); delete it to disable filtering");
+  return roots;
+};
 var insideRoots = (candidate, roots) => {
   if (candidate === null) return false;
-  const path4 = normalize(candidate);
-  return path4 !== null && roots.some((root) => path4 === root || path4.startsWith(root === "/" ? "/" : root + "/"));
+  const path5 = normalize(candidate);
+  return path5 !== null && roots.some((root) => path5 === root || path5.startsWith(root === "/" ? "/" : root + "/"));
+};
+
+// src/service/feedRootsFile.ts
+var FEED_ROOTS_MAX_BYTES = 64 * 1024;
+var feedRootsFilePath = (env, home = homedir()) => path.join(env.XDG_CONFIG_HOME && path.isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(home, ".config"), "aide-openchamber", "feed-roots");
+var loadFeedRoots = (env, home = homedir()) => {
+  if (env.AIDE_FEED_ROOTS !== void 0) return parseFeedRoots(env.AIDE_FEED_ROOTS);
+  const file = feedRootsFilePath(env, home);
+  try {
+    lstatSync(file);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw new Error("feed-roots file could not be inspected (" + error.code + ")");
+  }
+  let fd = null;
+  try {
+    if (!lstatSync(file).isFile()) throw new Error("feed-roots file is not a regular file (symlinks are refused)");
+    fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const info = fstatSync(fd);
+    if (!info.isFile()) throw new Error("feed-roots file is not a regular file");
+    if (info.size > FEED_ROOTS_MAX_BYTES) throw new Error("feed-roots file is larger than 64 KiB");
+    const buffer = Buffer.alloc(info.size);
+    let used = 0;
+    while (used < buffer.length) {
+      const n = readSync(fd, buffer, used, buffer.length - used, used);
+      if (!n) break;
+      used += n;
+    }
+    return parseFeedRootsFile(buffer.subarray(0, used).toString("utf8"));
+  } catch (error) {
+    const code = error.code;
+    if (code) throw new Error("feed-roots file could not be read (" + code + ")");
+    throw error;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
 };
 
 // src/service/server.ts
 import { execFile as execFile2 } from "node:child_process";
 import http from "node:http";
-import path2 from "node:path";
+import path3 from "node:path";
 
 // src/domain/cockpit.ts
 var COCKPIT_STATUSES = ["todo", "in_progress", "in_review", "qa", "done"];
@@ -78,9 +132,9 @@ var filterCockpitTasks = (tasks, email, mode, includeSubtasks) => {
 
 // src/service/cockpit.ts
 import { open } from "node:fs/promises";
-import { constants } from "node:fs";
-import { homedir } from "node:os";
-import path from "node:path";
+import { constants as constants2 } from "node:fs";
+import { homedir as homedir2 } from "node:os";
+import path2 from "node:path";
 var ENDPOINT = "https://cockpit.internal.angelsoftwares.ca/api/mcp/server";
 var VERSION = "2025-03-26";
 var ALLOWED_TOOLS = /* @__PURE__ */ new Set(["list_tasks", "get_task"]);
@@ -91,9 +145,9 @@ var fail = (reason) => {
 };
 var record = (v) => !!v && typeof v === "object" && !Array.isArray(v);
 var readKey = async () => {
-  const file = process.env.COCKPIT_API_KEY_FILE ?? path.join(homedir(), ".config/opencode/secrets/cockpit-api-key");
+  const file = process.env.COCKPIT_API_KEY_FILE ?? path2.join(homedir2(), ".config/opencode/secrets/cockpit-api-key");
   try {
-    const handle = await open(file, constants.O_RDONLY | constants.O_NONBLOCK);
+    const handle = await open(file, constants2.O_RDONLY | constants2.O_NONBLOCK);
     try {
       const stat2 = await handle.stat();
       if (!stat2.isFile() || stat2.size > 16384) return fail("Cockpit API key file is invalid");
@@ -262,7 +316,7 @@ var createCockpitReader = (options = {}) => {
 };
 
 // src/service/harness.ts
-import { constants as constants2 } from "node:fs";
+import { constants as constants3 } from "node:fs";
 import { open as open2, stat } from "node:fs/promises";
 import os from "node:os";
 
@@ -428,7 +482,7 @@ var readHarnessFeed = async (file, readStartTimes = processStartTimes.read, root
   let cutFirstLine = false;
   try {
     if (!(await stat(file)).isFile()) return { lanes: [], file: "not-regular", ...filtered() };
-    const handle = await open2(file, constants2.O_RDONLY | constants2.O_NONBLOCK);
+    const handle = await open2(file, constants3.O_RDONLY | constants3.O_NONBLOCK);
     try {
       const info = await handle.stat();
       if (!info.isFile()) return { lanes: [], file: "not-regular", ...filtered() };
@@ -519,7 +573,7 @@ var git = (directory, args) => new Promise((resolve) => {
   });
 });
 var createServiceServer = (token2, lanesFile2, cockpit = createCockpitReader(), feedRoots2 = null) => {
-  if (!path2.isAbsolute(lanesFile2)) throw new Error("AIDE_LANES_FILE must be absolute");
+  if (!path3.isAbsolute(lanesFile2)) throw new Error("AIDE_LANES_FILE must be absolute");
   return http.createServer((req, res) => {
     if (req.headers.authorization !== `Bearer ${token2}`) {
       json(res, 401, { error: "unauthorized" });
@@ -569,7 +623,7 @@ var createServiceServer = (token2, lanesFile2, cockpit = createCockpitReader(), 
       return;
     }
     const directory = url.searchParams.get("directory") ?? "";
-    if (!path2.isAbsolute(directory)) {
+    if (!path3.isAbsolute(directory)) {
       json(res, 400, { error: "bad-request" });
       return;
     }
@@ -590,10 +644,10 @@ if (!port || !token) {
   console.error("OPENCHAMBER_SERVICE_PORT and OPENCHAMBER_SERVICE_TOKEN are required");
   process.exit(1);
 }
-var lanesFile = process.env.AIDE_LANES_FILE ?? path3.join(homedir2(), ".local/share/aide/lanes.jsonl");
+var lanesFile = process.env.AIDE_LANES_FILE ?? path4.join(homedir3(), ".local/share/aide/lanes.jsonl");
 var feedRoots;
 try {
-  feedRoots = parseFeedRoots(process.env.AIDE_FEED_ROOTS);
+  feedRoots = loadFeedRoots(process.env);
 } catch (error) {
   console.error(error.message);
   process.exit(1);
