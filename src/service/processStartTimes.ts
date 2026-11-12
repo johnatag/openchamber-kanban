@@ -1,4 +1,6 @@
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 
 // Epoch seconds, matching ps's one-second precision. Kept at the OS boundary so
@@ -23,19 +25,47 @@ export const parseProcessStartTimes = (output: string): Map<number, number> => {
 };
 
 const exec = promisify(execFile);
+const platformPidMax = async (): Promise<number | null> => {
+  if (process.platform === 'darwin') return 99999;
+  if (process.platform === 'linux') {
+    try {
+      const value = (await readFile('/proc/sys/kernel/pid_max', 'utf8')).trim();
+      const maximum = Number(value);
+      if (/^\d+$/.test(value) && Number.isSafeInteger(maximum) && maximum > 0 && maximum <= 2147483647) return maximum;
+    } catch { /* Unknown limit: isolate each PID instead of risking the batch. */ }
+  }
+  return null;
+};
+
 export const processStartTimes: { read: ProcessStartTimeReader } = {
   read: async pids => {
     if (!pids.length) return new Map();
-    try {
-      const { stdout } = await exec('ps', ['-o', 'pid=', '-o', 'lstart=', '-p', [...new Set(pids)].join(',')],
-        { env: { ...process.env, LC_ALL: 'C' }, timeout: 2000, maxBuffer: 128 * 1024 });
-      return parseProcessStartTimes(stdout);
-    } catch (error) {
-      // ps can return 1 when requested PIDs have vanished; retain any readable rows.
-      const failure = error as { code?: unknown; stdout?: string };
-      if (failure.code === 1 && failure.stdout) return parseProcessStartTimes(failure.stdout);
-      console.error('Could not read process start times; harness liveness is unknown', error);
-      return new Map();
+    const maximum = await platformPidMax();
+    const eligible = [...new Set(pids)].filter(pid => Number.isSafeInteger(pid) && pid > 0 && pid <= (maximum ?? 2147483647));
+    if (!eligible.length) return new Map();
+    const executable = existsSync('/bin/ps') ? '/bin/ps' : 'ps';
+    const query = async (requested: number[]) => {
+      try {
+        const { stdout } = await exec(executable, ['-o', 'pid=', '-o', 'lstart=', '-p', requested.join(',')],
+          { env: { ...process.env, LC_ALL: 'C' }, timeout: 2000, maxBuffer: 128 * 1024 });
+        return { starts: parseProcessStartTimes(stdout), failed: false };
+      } catch (error) {
+        const failure = error as { code?: unknown; stdout?: string };
+        // Exit 1 (including empty output when all PIDs died) is normal.
+        if (failure.code !== 1) console.error('Could not read process start times; harness liveness is unknown', error);
+        return { starts: parseProcessStartTimes(failure.stdout ?? ''), failed: true };
+      }
+    };
+    const starts = new Map<number, number>();
+    if (maximum !== null) {
+      const batch = await query(eligible);
+      if (!batch.failed || eligible.length === 1) return batch.starts;
+      for (const [pid, start] of batch.starts) starts.set(pid, start);
     }
+    // A rejected PID must never discard evidence for its neighbours.
+    for (const pid of eligible) {
+      for (const [found, start] of (await query([pid])).starts) starts.set(found, start);
+    }
+    return starts;
   },
 };

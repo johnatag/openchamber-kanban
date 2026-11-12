@@ -37,7 +37,9 @@ const start = now / 1000 - 120;
 for (const [name, supervisor, command, expected] of [
   ['supervisor at +2 seconds', start + 2, undefined, 'running'],
   ['supervisor beyond +2 seconds', start + 2.001, undefined, 'lost'],
-  ['older supervisor', start - 1000, undefined, 'running'],
+  ['supervisor at -2 seconds', start - 2, undefined, 'running'],
+  ['supervisor before -2 seconds', start - 2.001, undefined, 'lost'],
+  ['older supervisor', start - 1000, undefined, 'lost'],
   ['command at -2 seconds', undefined, start - 2, 'running'],
   ['command before -2 seconds', undefined, start - 2.001, 'lost'],
   ['command at +60 seconds', undefined, start + 60, 'running'],
@@ -80,7 +82,7 @@ test('future tolerance includes five minutes but untrusted future records are lo
         startedAt: new Date(now + 300_001).toISOString(),
         ...(outcome ? { outcome, endedAt: new Date(now + 300_002).toISOString() } : {}) })),
     ].map(value => JSON.stringify(value)).join('\n'));
-    const response = await readHarnessFeed(file, async () => new Map([[process.pid, now / 1000]]));
+    const response = await readHarnessFeed(file, async () => new Map([[process.pid, (now + 300_000) / 1000]]));
     assert.equal(response.lanes.find(record => record.id === 'boundary')?.status, 'running');
     assert.ok(response.lanes.filter(record => record.id !== 'boundary').every(record => record.status === 'lost'));
   } finally { await rm(dir, { recursive: true, force: true }); }

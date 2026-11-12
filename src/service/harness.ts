@@ -71,7 +71,7 @@ export const readHarnessFeed = async (file: string, readStartTimes: ProcessStart
     };
     const future = started > now + 300_000;
     const alive = !future && started >= bootTime - BOOT_TOLERANCE_MS &&
-      (matchesProcess(lane.pid, -Infinity, started / 1000 + 2) ||
+      (matchesProcess(lane.pid, started / 1000 - 2, started / 1000 + 2) ||
        (lane.commandPid != null && matchesProcess(lane.commandPid, started / 1000 - 2, started / 1000 + 60)));
     return { ...lane, status: future ? 'lost' as const : harnessStatus(lane, alive), reportFile, logFile };
   }));
